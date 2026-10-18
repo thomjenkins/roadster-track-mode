@@ -16,6 +16,7 @@ const RACE_LAPS = 3;
 const GAS_RECHARGE = 6; // L/s — onboard compressor top-up (game liberty)
 const LIFT_A = 2.15 * G;
 const LIFT_POP = 7;
+const DIVE_A = 2 * G;
 
 // motorA: tire-driven launch accel (m/s^2), thrustA: extra cold-gas accel.
 // 17.6 + 28.4 → 0-60 ≈ 0.58 s.
@@ -993,7 +994,7 @@ const audio = {
 // ============================================================
 const keys = new Set();
 const actions = [];
-const input = { steer: 0, throttle: 0, brake: 0, boost: false, lift: false };
+const input = { steer: 0, throttle: 0, brake: 0, boost: false, lift: false, dive: false };
 let kbSteer = 0;
 let lastDevice = 'kb';
 let pad = null;
@@ -1075,19 +1076,20 @@ function pollPad(dt) {
   if (pressed(15)) sx = 1;
   const rt = value(7), lt = value(6);
   if (Math.abs(ax) > 0.3 || rt > 0.1 || lt > 0.1) lastDevice = 'pad';
-  return { steer: sx, throttle: rt, brake: lt, boost: pressed(0), lift: pressed(2) };
+  return { steer: sx, throttle: rt, brake: lt, boost: pressed(0), lift: pressed(2), dive: pressed(3) };
 }
 
 function readInput(dt) {
   const k = (...c) => c.some((x) => keys.has(x));
   const kSteer = (k('ArrowRight', 'KeyD') ? 1 : 0) - (k('ArrowLeft', 'KeyA') ? 1 : 0);
   kbSteer = approach(kbSteer, kSteer, dt * (kSteer === 0 || Math.sign(kSteer) !== Math.sign(kbSteer) ? 9 : 4.5));
-  const p = pollPad(dt) || { steer: 0, throttle: 0, brake: 0, boost: false, lift: false };
+  const p = pollPad(dt) || { steer: 0, throttle: 0, brake: 0, boost: false, lift: false, dive: false };
   input.steer = clamp(Math.abs(p.steer) > Math.abs(kbSteer) ? p.steer : kbSteer, -1, 1);
   input.throttle = Math.max(p.throttle, k('ArrowUp', 'KeyW') ? 1 : 0);
   input.brake = Math.max(p.brake, k('ArrowDown', 'KeyS') ? 1 : 0);
   input.boost = p.boost || k('Space');
   input.lift = p.lift || k('ShiftLeft', 'ShiftRight', 'KeyE');
+  input.dive = p.dive || k('KeyF');
 }
 
 let rumbleUntil = 0;
@@ -1393,8 +1395,16 @@ function stepAir(p, inp, dt) {
   // yaw thrusters + self-levelling
   p.F = rot(p.F, p.Up, -inp.steer * 1.9 * dt);
   const near = nearestFrame(p.P, true);
+  // suction fans only have something to pull against when there's track beneath
+  {
+    const d0 = sub(p.P, fP(near.i));
+    const below = Math.abs(dot(d0, fT(near.i))) < 3 && Math.abs(dot(d0, fR(near.i))) < HALF_W && dot(d0, fU(near.i)) > -1;
+    p.diveHeld = inp.dive && !p.lifting;
+    p.diving = p.diveHeld && below;
+    if (p.diving) p.V = madd(p.V, fU(near.i), -DIVE_A * dt);
+  }
   const tgtUp = near.d < 30 ? fU(near.i) : UPW;
-  const k = 1 - Math.exp(-2.5 * dt);
+  const k = 1 - Math.exp(-(p.diving ? 6 : 2.5) * dt);
   p.Up = norm(add(scl(p.Up, 1 - k), scl(tgtUp, k)));
   p.F = norm(madd(p.F, p.Up, -dot(p.F, p.Up)));
 
@@ -1640,7 +1650,7 @@ function completeLap(p) {
 function simStep(dt) {
   simClock += dt;
   if (state === 'race' || state === 'results') raceTime += dt;
-  const auto = { steer: 0, throttle: 0, brake: 0.35, boost: false, lift: false };
+  const auto = { steer: 0, throttle: 0, brake: 0.35, boost: false, lift: false, dive: false };
   stepPlayer(player, player.finished ? auto : input, dt);
   for (const r of rivals) stepRival(r, dt);
   collide();
@@ -1693,7 +1703,7 @@ function handleActions() {
       else if (a === 'confirm') startRace();
     } else if (state === 'race' || state === 'countdown') {
       if (a === 'pause') pauseGame();
-      else if (a === 'aero' && player) {
+      else if (a === 'aero' && player && player.mode === 'track') {
         player.aero = player.aero === 0 ? 1 : 0;
         toast(player.aero === 0 ? 'High downforce — fans max (holds upside down)' : 'Low drag — fans eco, wing flat');
         rumble(0.2, 0.3, 80, true);
@@ -1761,7 +1771,7 @@ function renderOverlay() {
           <tr><td>RT / LT</td><td>Throttle / brake (analog) · LT at rest = reverse</td></tr>
           <tr><td>${X('A', 'a')} hold</td><td>Cold-gas thrusters — boost</td></tr>
           <tr><td>${X('X', 'x')} hold</td><td>Lift thrusters — hop barriers, fly</td></tr>
-          <tr><td>${X('Y', 'y')}</td><td>Aero: high downforce ↔ low drag</td></tr>
+          <tr><td>${X('Y', 'y')}</td><td>Aero: high downforce ↔ low drag · hold in the air to dive</td></tr>
           <tr><td>${X('B', 'b')}</td><td>Reset to track</td></tr>
           <tr><td>LB / RB</td><td>Change camera</td></tr>
           <tr><td>☰ Menu / ⧉ View</td><td>Pause / restart</td></tr>
@@ -1771,7 +1781,7 @@ function renderOverlay() {
           <tr><td><kbd>↑</kbd><kbd>↓</kbd> or <kbd>W</kbd><kbd>S</kbd></td><td>Throttle / brake · reverse</td></tr>
           <tr><td><kbd>Space</kbd></td><td>Cold-gas thrusters</td></tr>
           <tr><td><kbd>Shift</kbd> / <kbd>E</kbd></td><td>Lift thrusters — fly</td></tr>
-          <tr><td><kbd>F</kbd> · <kbd>C</kbd></td><td>Aero mode · camera</td></tr>
+          <tr><td><kbd>F</kbd> · <kbd>C</kbd></td><td>Aero mode (hold in the air to dive) · camera</td></tr>
           <tr><td><kbd>R</kbd> · <kbd>T</kbd></td><td>Reset to track · restart</td></tr>
           <tr><td><kbd>Esc</kbd> · <kbd>M</kbd></td><td>Pause · mute</td></tr>
         </table></div>
@@ -1945,7 +1955,7 @@ function drawPlayerHUD() {
   text(Math.round(mph).toString(), cx, cy + 12, 44, '#fff', 'center', 700);
   text('MPH', cx, cy + 32, 11, '#9aa0a8', 'center', 600);
   let label, col;
-  if (p.mode === 'air') { label = `AIRBORNE · ${p.airTime.toFixed(1)} s`; col = '#7cf7ff'; }
+  if (p.mode === 'air') { label = p.diving ? 'DIVE · FANS PULLING DOWN' : p.diveHeld ? 'DIVE · WAITING FOR TRACK BELOW' : `AIRBORNE · ${p.airTime.toFixed(1)} s`; col = '#7cf7ff'; }
   else if (p.inverted) { label = 'UPSIDE DOWN · FANS HOLDING'; col = '#ff9f43'; }
   else { label = p.aero === 0 ? 'HIGH DOWNFORCE' : 'LOW DRAG'; col = p.aero === 0 ? '#9fd4ff' : '#f2c230'; }
   text(label, cx, cy + 62, 11, col, 'center', 700);
