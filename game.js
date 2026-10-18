@@ -1057,10 +1057,11 @@ function pollPad(dt) {
     const i = +k;
     if (pressed(i) && !padPrev[i]) { actions.push(PAD_ACTIONS[k]); lastDevice = 'pad'; }
   }
+  const menuState = state !== 'race' && state !== 'countdown';
+  if (!menuState && pressed(12) && !padPrev[12]) actions.push('reset');
   padPrev = gp.buttons.map((b) => b.pressed);
 
   const ax = gp.axes[0] || 0, ay = gp.axes[1] || 0;
-  const menuState = state !== 'race' && state !== 'countdown';
   let dir = null;
   if (Math.abs(ax) > 0.6 && Math.abs(ax) >= Math.abs(ay)) dir = ax > 0 ? 'right' : 'left';
   else if (Math.abs(ay) > 0.6) dir = ay > 0 ? 'down' : 'up';
@@ -1707,7 +1708,7 @@ function handleActions() {
         player.aero = player.aero === 0 ? 1 : 0;
         toast(player.aero === 0 ? 'High downforce — fans max (holds upside down)' : 'Low drag — fans eco, wing flat');
         rumble(0.2, 0.3, 80, true);
-      } else if ((a === 'reset' || a === 'back') && state === 'race' && player && !player.finished) resetToTrack(player);
+      } else if (a === 'reset' && state === 'race' && player && !player.finished) resetToTrack(player);
       else if (a === 'restart') startRace();
     } else if (state === 'paused') {
       const items = ['resume', 'restart', 'menu'];
@@ -1772,7 +1773,8 @@ function renderOverlay() {
           <tr><td>${X('A', 'a')} hold</td><td>Cold-gas thrusters — boost</td></tr>
           <tr><td>${X('X', 'x')} hold</td><td>Lift thrusters — hop barriers, fly</td></tr>
           <tr><td>${X('Y', 'y')}</td><td>Aero: high downforce ↔ low drag · hold in the air to dive</td></tr>
-          <tr><td>${X('B', 'b')}</td><td>Reset to track</td></tr>
+          <tr><td>D-pad ↑</td><td>Reset to track</td></tr>
+          <tr><td>${X('B', 'b')}</td><td>Back (menus)</td></tr>
           <tr><td>LB / RB</td><td>Change camera</td></tr>
           <tr><td>☰ Menu / ⧉ View</td><td>Pause / restart</td></tr>
         </table></div>
@@ -2028,7 +2030,7 @@ function drawPlayerHUD() {
   drawMinimap();
 
   const hint = lastDevice === 'pad'
-    ? 'RT throttle · LT brake · A thrusters · X lift · Y aero · B reset · LB/RB camera · ☰ pause'
+    ? 'RT throttle · LT brake · A thrusters · X lift · Y aero/dive · D-pad ↑ reset · LB/RB camera · ☰ pause'
     : '↑ throttle · ↓ brake · Space thrusters · Shift lift · F aero · C camera · R reset · Esc pause';
   text(hint, W / 2, H - 6, 11, 'rgba(255,255,255,0.55)', 'center', 500);
 
