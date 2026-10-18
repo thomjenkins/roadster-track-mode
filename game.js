@@ -4,7 +4,7 @@
 const THREE = window.THREE;
 
 // ============================================================
-// Specs — next-gen Tesla Roadster, every announced capability in one car
+// Specs — every announced next-gen Roadster capability in one car
 // ============================================================
 const G = 9.81;
 const MPH = 2.23694;
@@ -823,7 +823,7 @@ function basisAt(i, kind = 'TUR') {
     leg.castShadow = true;
     scene.add(leg);
   }
-  const banner = new THREE.MeshBasicMaterial({ map: textTex('TESLA  ROADSTER', 1024, 160, '#111', '#fff') });
+  const banner = new THREE.MeshBasicMaterial({ map: textTex('THRUSTER  ROADSTER', 1024, 160, '#111', '#fff') });
   const beam = new THREE.Mesh(new THREE.BoxGeometry(1.2, 2.4, HALF_W * 2 + 4), [banner, banner, mat, mat, mat, mat]);
   beam.quaternion.setFromRotationMatrix(basisAt(i, 'TUR'));
   beam.position.set(P[0], 9, P[2]);
@@ -2125,13 +2125,13 @@ function renderOverlay() {
   let html = '';
   if (state === 'title') {
     html = `<div class="panel">
-      <div class="brand">ROADSTER<span>TRACK MODE</span></div>
-      <div class="sub">Loops, canyon jumps and wall rides — the next-gen Tesla Roadster's suction fans hold it upside down, and its thrusters let it fly</div>
+      <div class="brand">THRUSTER ROADSTER<span>TRACK MODE</span></div>
+      <div class="sub">Loops, canyon jumps and wall rides — suction fans hold it upside down, and its thrusters let it fly</div>
       ${(() => {
         const t = ROADSTER, best = store.get('best.' + t.id), z60 = store.get('z60.' + t.id);
         return `<div class="row"><div class="cards"><div class="card sel">
           <div class="swatch" style="background:${t.css}"></div>
-          <h2>Tesla ${t.name}</h2>
+          <h2>Thruster ${t.name}</h2>
           <div class="stats"><div><b>${t.zeroSixty}</b><span>0–60 mph</span></div><div><b>${t.topSpeed}</b><span>Top speed</span></div></div>
           <ul>${t.features.map((f) => `<li>${f}</li>`).join('')}</ul>
           <div class="pb">Best lap ${best != null ? fmtTime(best) : '—'} · Best 0–60 ${fmtSec(z60)}</div>
@@ -2165,6 +2165,7 @@ function renderOverlay() {
         </table></div>
       </div>
       ${padStatusHTML()}
+      <div class="disclaimer">Unofficial fan game inspired by the next-gen Roadster. Not affiliated with or endorsed by Tesla, Inc.</div>
     </div>`;
   } else if (state === 'paused') {
     const items = [['resume', 'Resume'], ['restart', 'Restart'], ['menu', 'Main menu']];

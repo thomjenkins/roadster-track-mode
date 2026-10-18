@@ -30,10 +30,10 @@ canvas { display: block; position: fixed; top: 0; left: 0; }
 
 .brand {
   text-align: center;
-  font-size: 54px;
+  font-size: 46px;
   font-weight: 800;
-  letter-spacing: 0.32em;
-  padding-left: 0.32em;
+  letter-spacing: 0.22em;
+  padding-left: 0.22em;
 }
 .brand span {
   display: block;
@@ -143,6 +143,7 @@ kbd.y { background: #f2c230; }
 
 .padstatus { text-align: center; margin-top: 18px; font-size: 13px; color: #8a9099; }
 .padstatus.on { color: #6fdc8c; }
+.disclaimer { text-align: center; margin-top: 14px; font-size: 11px; color: #6b7079; }
 
 .menu-list { display: flex; flex-direction: column; gap: 10px; margin-top: 22px; }
 .menu-item {
