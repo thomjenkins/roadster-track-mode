@@ -359,7 +359,7 @@ const ctx = hudCanvas.getContext('2d');
 const overlay = document.getElementById('overlay');
 let W = 0, H = 0, DPR = 1;
 
-const renderer = new THREE.WebGLRenderer({ canvas: glCanvas, antialias: true, powerPreference: 'high-performance' });
+const renderer = new THREE.WebGLRenderer({ canvas: glCanvas, antialias: false, powerPreference: 'high-performance' });
 renderer.outputEncoding = THREE.sRGBEncoding;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 0.88;
@@ -370,11 +370,133 @@ const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(68, 1, 0.5, 6000);
 scene.fog = new THREE.Fog(0xcad9e6, 350, 2600);
 
+// ---------- post: HDR scene (MSAA) -> dual-filter bloom -> tonemap, grade, vignette ----------
+// Rendering into a float target skips three's own tonemapping/encoding, so the composite does both.
+const post = (() => {
+  const gl2 = renderer.capabilities.isWebGL2;
+  const hdr = { type: THREE.HalfFloatType, depthBuffer: false };
+  const sceneRT = new THREE.WebGLRenderTarget(1, 1, { type: THREE.HalfFloatType, samples: gl2 ? 4 : 0 });
+  const LEVELS = 6;
+  const mips = Array.from({ length: LEVELS }, () => new THREE.WebGLRenderTarget(1, 1, hdr));
+  const qCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+  const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2));
+  quad.frustumCulled = false;
+  const qScene = new THREE.Scene();
+  qScene.add(quad);
+  const VS = 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }';
+  const mat = (fs, uniforms, extra = {}) => new THREE.ShaderMaterial({ vertexShader: VS, fragmentShader: fs, uniforms, depthTest: false, depthWrite: false, ...extra });
+  const prefilter = mat(`
+    uniform sampler2D src; uniform vec2 texel; uniform float threshold; varying vec2 vUv;
+    vec3 tap(vec2 o) { vec3 c = texture2D(src, vUv + o * texel).rgb; float b = max(c.r, max(c.g, c.b));
+      float soft = clamp(b - threshold + 0.5, 0.0, 1.0); soft = soft * soft * 0.5;
+      float w = max(soft, b - threshold) / max(b, 1e-4); return c * w / (1.0 + b * w); }
+    void main() { vec3 c = tap(vec2(-1.0, -1.0)) + tap(vec2(1.0, -1.0)) + tap(vec2(-1.0, 1.0)) + tap(vec2(1.0, 1.0));
+      c *= 0.25; float b = max(c.r, max(c.g, c.b)); gl_FragColor = vec4(c / max(1.0 - b, 0.04), 1.0); }`,
+  { src: { value: null }, texel: { value: new THREE.Vector2() }, threshold: { value: 1.6 } });
+  const down = mat(`
+    uniform sampler2D src; uniform vec2 texel; varying vec2 vUv;
+    void main() { vec3 c = texture2D(src, vUv).rgb * 4.0;
+      c += texture2D(src, vUv + vec2(-1.0, -1.0) * texel).rgb + texture2D(src, vUv + vec2(1.0, -1.0) * texel).rgb;
+      c += texture2D(src, vUv + vec2(-1.0, 1.0) * texel).rgb + texture2D(src, vUv + vec2(1.0, 1.0) * texel).rgb;
+      gl_FragColor = vec4(c * 0.125, 1.0); }`,
+  { src: { value: null }, texel: { value: new THREE.Vector2() } });
+  const up = mat(`
+    uniform sampler2D src; uniform vec2 texel; uniform float weight; varying vec2 vUv;
+    void main() { vec3 c = vec3(0.0);
+      c += texture2D(src, vUv + vec2(-2.0, 0.0) * texel).rgb + texture2D(src, vUv + vec2(2.0, 0.0) * texel).rgb;
+      c += texture2D(src, vUv + vec2(0.0, -2.0) * texel).rgb + texture2D(src, vUv + vec2(0.0, 2.0) * texel).rgb;
+      c += (texture2D(src, vUv + vec2(-1.0, 1.0) * texel).rgb + texture2D(src, vUv + vec2(1.0, 1.0) * texel).rgb
+          + texture2D(src, vUv + vec2(-1.0, -1.0) * texel).rgb + texture2D(src, vUv + vec2(1.0, -1.0) * texel).rgb) * 2.0;
+      gl_FragColor = vec4(c / 12.0 * weight, 1.0); }`,
+  { src: { value: null }, texel: { value: new THREE.Vector2() }, weight: { value: 1 } }, { blending: THREE.AdditiveBlending, transparent: true });
+  const composite = mat(`
+    uniform sampler2D scene; uniform sampler2D bloom; uniform float bloomStrength; uniform float exposure; uniform float time; uniform vec2 aspect;
+    varying vec2 vUv;
+    vec3 rrtOdt(vec3 v) { vec3 a = v * (v + 0.0245786) - 0.000090537; vec3 b = v * (0.983729 * v + 0.4329510) + 0.238081; return a / b; }
+    vec3 acesFit(vec3 color) {
+      const mat3 IN = mat3(vec3(0.59719, 0.07600, 0.02840), vec3(0.35458, 0.90834, 0.13383), vec3(0.04823, 0.01566, 0.83777));
+      const mat3 OUT = mat3(vec3(1.60475, -0.10208, -0.00327), vec3(-0.53108, 1.10813, -0.07276), vec3(-0.07367, -0.00605, 1.07602));
+      color *= exposure / 0.6; color = OUT * rrtOdt(IN * color); return clamp(color, 0.0, 1.0); }
+    vec3 toSRGB(vec3 c) { return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, c)); }
+    float hash(vec2 p) { return fract(sin(dot(p, vec2(12.9898, 78.233)) + time) * 43758.5453); }
+    void main() {
+      vec2 d = (vUv - 0.5) * aspect;
+      vec3 c = texture2D(scene, vUv).rgb;
+      c += texture2D(bloom, vUv).rgb * bloomStrength;
+      c = toSRGB(acesFit(c));
+      float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+      c = mix(vec3(l), c, 1.1);
+      c = mix(c, c * c * (3.0 - 2.0 * c), 0.3);
+      c *= mix(vec3(0.97, 0.985, 1.03), vec3(1.03, 1.0, 0.95), smoothstep(0.2, 0.8, l));
+      c *= 1.0 - 0.32 * smoothstep(0.35, 1.05, length(d));
+      c += (hash(vUv * 731.0) - 0.5) / 255.0;
+      gl_FragColor = vec4(c, 1.0); }`,
+  { scene: { value: sceneRT.texture }, bloom: { value: mips[0].texture }, bloomStrength: { value: 0.11 }, exposure: { value: renderer.toneMappingExposure }, time: { value: 0 }, aspect: { value: new THREE.Vector2(1, 1) } });
+  const pass = (material, target) => { quad.material = material; renderer.setRenderTarget(target); renderer.render(qScene, qCam); };
+  return {
+    sceneRT, composite,
+    setSize(w, h) {
+      sceneRT.setSize(w, h);
+      let mw = w, mh = h;
+      for (const m of mips) { mw = Math.max(1, Math.round(mw / 2)); mh = Math.max(1, Math.round(mh / 2)); m.setSize(mw, mh); }
+      composite.uniforms.aspect.value.set(w / h, 1);
+    },
+    render(sc, cm) {
+      renderer.setRenderTarget(sceneRT);
+      renderer.render(sc, cm);
+      prefilter.uniforms.src.value = sceneRT.texture;
+      prefilter.uniforms.texel.value.set(1 / sceneRT.width, 1 / sceneRT.height);
+      pass(prefilter, mips[0]);
+      for (let i = 1; i < LEVELS; i++) {
+        down.uniforms.src.value = mips[i - 1].texture;
+        down.uniforms.texel.value.set(1 / mips[i - 1].width, 1 / mips[i - 1].height);
+        pass(down, mips[i]);
+      }
+      renderer.autoClear = false;
+      for (let i = LEVELS - 1; i > 0; i--) {
+        up.uniforms.src.value = mips[i].texture;
+        up.uniforms.texel.value.set(0.5 / mips[i].width, 0.5 / mips[i].height);
+        pass(up, mips[i - 1]);
+      }
+      renderer.autoClear = true;
+      composite.uniforms.time.value = (performance.now() % 1000) / 1000;
+      pass(composite, null);
+    },
+  };
+})();
+
+// Dynamic resolution: step the 3D render scale down when frames run long, back up (once) when there's headroom.
+const perf = { scale: 1, acc: 0, n: 0, cool: 3, slow: 0, fast: 0, wentUp: false, lockUp: false };
+function trackPerf(dt) {
+  perf.cool -= dt;
+  perf.acc += dt; perf.n++;
+  if (perf.n < 90) return;
+  const avg = perf.acc / perf.n;
+  perf.acc = 0; perf.n = 0;
+  if (perf.cool > 0 || document.hidden || dt > 0.09) return;
+  if (avg > 1 / 48) {
+    perf.fast = 0;
+    if (++perf.slow >= 2 && perf.scale > 0.55) {
+      perf.scale = Math.max(0.55, perf.scale - 0.15); perf.slow = 0; perf.cool = 2;
+      if (perf.wentUp) perf.lockUp = true;
+      resize();
+    }
+  } else if (avg < 1 / 57) {
+    perf.slow = 0;
+    if (++perf.fast >= 8 && perf.scale < 1 && !perf.lockUp) {
+      perf.scale = Math.min(1, perf.scale + 0.15); perf.fast = 0; perf.cool = 2; perf.wentUp = true;
+      resize();
+    }
+  } else { perf.slow = 0; perf.fast = 0; }
+}
+
 function resize() {
   DPR = Math.min(2, window.devicePixelRatio || 1);
   W = window.innerWidth; H = window.innerHeight;
-  renderer.setPixelRatio(DPR);
+  const gpr = Math.min(1.5, DPR) * perf.scale;
+  renderer.setPixelRatio(gpr);
   renderer.setSize(W, H, false);
+  post.setSize(Math.round(W * gpr), Math.round(H * gpr));
   glCanvas.style.width = W + 'px'; glCanvas.style.height = H + 'px';
   hudCanvas.width = Math.round(W * DPR); hudCanvas.height = Math.round(H * DPR);
   hudCanvas.style.width = W + 'px'; hudCanvas.style.height = H + 'px';
@@ -396,32 +518,145 @@ function canvasTex(w, h, draw, repeat = true) {
   return t;
 }
 
-const asphaltTex = canvasTex(256, 512, (g, w, h) => {
-  g.fillStyle = '#3a3d42'; g.fillRect(0, 0, w, h);
-  const r = rng(5);
-  for (let i = 0; i < 9000; i++) {
-    const l = 40 + r() * 50;
-    g.fillStyle = `rgba(${l},${l + 2},${l + 6},${0.35 + r() * 0.4})`;
-    g.fillRect(r() * w, r() * h, 1 + r() * 2, 1 + r() * 2);
+// tileable value noise over a w×h pixel grid (period in lattice cells must divide the size)
+function tileNoise(w, h, cell, seed) {
+  const pw = Math.max(1, Math.round(w / cell)), ph = Math.max(1, Math.round(h / cell));
+  const lat = new Float32Array(pw * ph);
+  const r = rng(seed);
+  for (let i = 0; i < lat.length; i++) lat[i] = r();
+  const out = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) {
+    const fy = (y / h) * ph, j = Math.floor(fy), ty = fy - j, sy = ty * ty * (3 - 2 * ty);
+    const j0 = (j % ph) * pw, j1 = ((j + 1) % ph) * pw;
+    for (let x = 0; x < w; x++) {
+      const fx = (x / w) * pw, i = Math.floor(fx), tx = fx - i, sx = tx * tx * (3 - 2 * tx);
+      const i0 = i % pw, i1 = (i + 1) % pw;
+      out[y * w + x] = lerp(lerp(lat[j0 + i0], lat[j0 + i1], sx), lerp(lat[j1 + i0], lat[j1 + i1], sx), sy);
+    }
   }
-  for (let k = 0; k < 4; k++) {
-    g.fillStyle = k % 2 ? '#f2f2f2' : '#d42131';
-    g.fillRect(0, k * 128, 12, 128);
-    g.fillRect(w - 12, k * 128, 12, 128);
+  return out;
+}
+// height field -> tangent-space normal map
+function normalTex(hgt, w, h, strength) {
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const g = c.getContext('2d'), img = g.createImageData(w, h), d = img.data;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const hx = hgt[y * w + ((x + 1) % w)] - hgt[y * w + ((x - 1 + w) % w)];
+    const hy = hgt[((y + 1) % h) * w + x] - hgt[((y - 1 + h) % h) * w + x];
+    let nx = -hx * strength, ny = hy * strength;
+    const l = Math.hypot(nx, ny, 1);
+    const o = (y * w + x) * 4;
+    d[o] = (nx / l * 0.5 + 0.5) * 255; d[o + 1] = (ny / l * 0.5 + 0.5) * 255; d[o + 2] = (1 / l * 0.5 + 0.5) * 255; d[o + 3] = 255;
   }
-  g.fillStyle = '#e8e8e8';
-  g.fillRect(14, 0, 5, h); g.fillRect(w - 19, 0, 5, h);
-  g.fillStyle = 'rgba(240,240,240,0.75)';
-  g.fillRect(w / 2 - 2, 0, 4, 220);
-});
+  g.putImageData(img, 0, 0);
+  const t = new THREE.CanvasTexture(c);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  return t;
+}
+function dataCanvasTex(w, h, fn, srgb) {
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const g = c.getContext('2d'), img = g.createImageData(w, h);
+  for (let k = 0; k < w * h; k++) { const v = fn(k); img.data.set([v[0], v[1], v[2], 255], k * 4); }
+  g.putImageData(img, 0, 0);
+  const t = new THREE.CanvasTexture(c);
+  if (srgb) t.encoding = THREE.sRGBEncoding;
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  return { tex: t, g, c };
+}
 
-const wallTex = canvasTex(64, 256, (g, w, h) => {
-  g.fillStyle = '#f1f2f4'; g.fillRect(0, 0, w, h);
-  g.fillStyle = '#d42131';
-  g.fillRect(0, 0, w, 128);
-  g.fillStyle = 'rgba(0,0,0,0.08)';
-  g.fillRect(0, 0, w, 6);
-});
+// asphalt: 14 m across (u) × 10 m along (v); aggregate height drives albedo, normals and roughness
+const asphalt = (() => {
+  const w = 1024, h = 768, n = w * h;
+  const n1 = tileNoise(w, h, 1.6, 21), n2 = tileNoise(w, h, 4, 22), n3 = tileNoise(w, h, 48, 23), n4 = tileNoise(w, h, 160, 24);
+  const r = rng(25);
+  const hgt = new Float32Array(n), grain = new Float32Array(n);
+  for (let k = 0; k < n; k++) {
+    const stone = Math.max(0, n1[k] * 0.7 + n2[k] * 0.5 - 0.62) * 3;
+    hgt[k] = stone + r() * 0.12;
+    grain[k] = r();
+  }
+  const latOf = (x) => (x / w) * 14 - 7;
+  const rubber = (x) => { const l = Math.abs(latOf(x)); return Math.exp(-(((l - 2.4) / 1.1) ** 2)) * 0.6 + Math.exp(-((l / 1.6) ** 2)) * 0.25; };
+  const rub = new Float32Array(w);
+  for (let x = 0; x < w; x++) rub[x] = rubber(x);
+  const map = dataCanvasTex(w, h, (k) => {
+    const x = k % w;
+    let l = 56 + hgt[k] * 9 + (grain[k] - 0.5) * 8 + (n3[k] - 0.5) * 12 + (n4[k] - 0.5) * 14;
+    l *= 1 - rub[x] * (0.28 + n3[k] * 0.12);
+    return [l, l * 1.02, l * 1.07];
+  }, true);
+  const g = map.g;
+  // paint: edge lines + centre dashes, slightly worn
+  const px = (lat) => ((lat + 7) / 14) * w;
+  const paint = (x0, x1, y0, y1) => {
+    for (let y = y0; y < y1; y += 2) {
+      g.fillStyle = `rgba(232,232,226,${0.72 + r() * 0.25})`;
+      g.fillRect(x0, y, x1 - x0, 2);
+    }
+  };
+  for (const s of [-1, 1]) paint(Math.min(px(s * 5.55), px(s * 5.75)), Math.max(px(s * 5.55), px(s * 5.75)), 0, h);
+  paint(px(-0.08), px(0.08), 0, h * 0.4);
+  // a few faint skid marks
+  g.lineCap = 'round';
+  for (let i = 0; i < 7; i++) {
+    const x = px((r() - 0.5) * 9), y = r() * h, len = 120 + r() * 260, bend = (r() - 0.5) * 40;
+    g.strokeStyle = `rgba(10,10,12,${0.08 + r() * 0.1})`;
+    for (const off of [0, 115]) {
+      g.lineWidth = 14 + r() * 5;
+      g.beginPath(); g.moveTo(x + off, y); g.quadraticCurveTo(x + off + bend, y + len / 2, x + off + bend * 0.3, y + len); g.stroke();
+    }
+  }
+  map.tex.needsUpdate = true;
+  const rough = dataCanvasTex(w, h, (k) => {
+    const x = k % w;
+    const v = (0.9 - hgt[k] * 0.12 - rub[x] * 0.16 + (n3[k] - 0.5) * 0.08) * 255;
+    return [v, v, v];
+  }, false);
+  for (const s of [-1, 1]) { rough.g.fillStyle = 'rgb(150,150,150)'; rough.g.fillRect(Math.min(px(s * 5.55), px(s * 5.75)), 0, Math.abs(px(s * 5.75) - px(s * 5.55)), h); }
+  rough.g.fillRect(px(-0.08), 0, px(0.08) - px(-0.08), h * 0.4);
+  rough.tex.needsUpdate = true;
+  return { map: map.tex, rough: rough.tex, normal: normalTex(hgt, w, h, 1.2) };
+})();
+
+// red/white kerb, 1 m wide (u) × 6 m (v); transverse ribs are baked into normals
+const kerb = (() => {
+  const w = 64, h = 512, n = w * h;
+  const hgt = new Float32Array(n);
+  const map = dataCanvasTex(w, h, (k) => {
+    const x = k % w, y = Math.floor(k / w);
+    const rib = 0.5 + 0.5 * Math.cos((y / h) * 6 * Math.PI * 2 * 4);
+    hgt[k] = rib * 0.6 + (x < 4 ? -1 : 0);
+    const red = Math.floor((y / h) * 4) % 2 === 0;
+    const shade = 0.86 + rib * 0.14;
+    const c = red ? [196, 30, 40] : [226, 226, 220];
+    return [c[0] * shade, c[1] * shade, c[2] * shade];
+  }, true);
+  return { map: map.tex, normal: normalTex(hgt, w, h, 1.6) };
+})();
+
+// concrete barrier: height across u (0 bottom → 1 cap), 8 m along v; painted red/white top band
+const concreteTex = (band) => {
+  const w = 128, h = 512;
+  const n1 = tileNoise(w, h, 4, 31), n2 = tileNoise(w, h, 24, 32);
+  const r = rng(33);
+  const m = dataCanvasTex(w, h, (k) => {
+    const x = k % w, y = Math.floor(k / w), u = x / w;
+    let c;
+    if (band && u > 0.62 && u < 0.9) c = Math.floor(y / (h / 2)) % 2 ? [214, 214, 208] : [178, 30, 38];
+    else c = [150, 148, 142];
+    const grime = 1 - smoothstep(0.35, 0, u) * 0.35 - (u > 0.9 ? 0 : (1 - n2[k]) * 0.12);
+    const v = grime * (0.9 + n1[k] * 0.14 + (r() - 0.5) * 0.06);
+    const joint = (y % (h / 2)) < 2 ? 0.55 : 1;
+    return [c[0] * v * joint, c[1] * v * joint, c[2] * v * joint];
+  }, true);
+  return m.tex;
+};
+const wallTex = concreteTex(true);
+const slabTex = concreteTex(false);
 
 // neutral detail layer — terrain vertex colours supply the hue
 const grassTex = canvasTex(512, 512, (g, w, h) => {
@@ -519,14 +754,19 @@ function skyMaterial() {
   scene.environment = pmrem.fromScene(envScene, 0.02).texture;
 }
 scene.fog.color.setRGB(...HORIZON);
-scene.fog.near = 300; scene.fog.far = 3400;
+// aerial perspective: exponential haze starting at fog.near, ~55% by 2 km, so mid-distance gains depth too
+scene.fog.near = 60; scene.fog.far = 5400;
+THREE.ShaderChunk.fog_fragment = THREE.ShaderChunk.fog_fragment.replace(
+  'float fogFactor = smoothstep( fogNear, fogFar, vFogDepth );',
+  'float fogFactor = 1.0 - exp( -max( vFogDepth - fogNear, 0.0 ) / ( fogFar - fogNear ) * 1.9 );');
 scene.add(new THREE.HemisphereLight(0xa9c2f0, 0x6a5434, 0.5));
 const sun = new THREE.DirectionalLight(0xffd2a0, 2.3);
 sun.castShadow = true;
 sun.shadow.mapSize.set(2048, 2048);
-Object.assign(sun.shadow.camera, { left: -60, right: 60, top: 60, bottom: -60, near: 1, far: 420 });
+Object.assign(sun.shadow.camera, { left: -64, right: 64, top: 64, bottom: -64, near: 1, far: 420 });
 sun.shadow.bias = -0.0003;
 sun.shadow.normalBias = 0.04;
+sun.shadow.camera.layers.enable(1); // layer 1 = shadow-only proxies (vegetation)
 scene.add(sun);
 scene.add(sun.target);
 
@@ -674,7 +914,25 @@ const groundHeight = terrain.height;
     scene.add(water);
   }
   grassTex.repeat.set(terrain.SIZE / 6, terrain.SIZE / 6);
-  const ground = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ vertexColors: true, map: grassTex, roughness: 0.96 }));
+  const groundMat = new THREE.MeshStandardMaterial({ vertexColors: true, map: grassTex, roughness: 0.96 });
+  // world-space patchiness (dry patches, clumps) + a second detail scale to hide the 6 m tile
+  groundMat.onBeforeCompile = (sh) => {
+    sh.vertexShader = sh.vertexShader.replace('#include <common>', '#include <common>\nvarying vec3 vWPos;')
+      .replace('#include <project_vertex>', '#include <project_vertex>\nvWPos = (modelMatrix * vec4(transformed, 1.0)).xyz;');
+    sh.fragmentShader = sh.fragmentShader.replace('#include <common>', `#include <common>
+      varying vec3 vWPos;
+      float gH(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+      float gN(vec2 p) { vec2 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
+        return mix(mix(gH(i), gH(i + vec2(1.0, 0.0)), f.x), mix(gH(i + vec2(0.0, 1.0)), gH(i + vec2(1.0, 1.0)), f.x), f.y); }`)
+      .replace('#include <color_fragment>', `#include <color_fragment>
+      { vec2 wp = vWPos.xz;
+        float m1 = gN(wp / 21.0) * 0.6 + gN(wp / 9.0 + 7.3) * 0.4, m2 = gN(wp / 2.6 + 13.1), m3 = gN(wp / 85.0 - 4.7) * 0.7 + gN(wp / 37.0 + 2.2) * 0.3;
+        diffuseColor.rgb *= mix(vec3(1.0), vec3(1.35, 1.1, 0.68), smoothstep(0.42, 0.8, m3) * 0.55);
+        diffuseColor.rgb *= 0.66 + 0.5 * m1 + 0.2 * (m2 - 0.5);
+        float d2 = texture2D(map, vUv * 0.217 + vec2(0.37, 0.71)).g / 0.66;
+        diffuseColor.rgb *= mix(1.0, d2, 0.55); }`);
+  };
+  const ground = new THREE.Mesh(geo, groundMat);
   ground.receiveShadow = true;
   scene.add(ground);
   const far = new THREE.Mesh(new THREE.RingGeometry(terrain.SIZE * 0.47, 20000, 64, 1), new THREE.MeshLambertMaterial({ color: new THREE.Color(0.3, 0.25, 0.11) }));
@@ -727,11 +985,22 @@ function strip(run, a, b, vRep, mat, uA = 0, uB = 1, cast = false) {
 }
 
 {
-  const topMat = new THREE.MeshStandardMaterial({ map: asphaltTex, roughness: 0.92, metalness: 0 });
-  const slabMat = new THREE.MeshStandardMaterial({ color: 0x6b7078, roughness: 0.9 });
-  const wallMat = new THREE.MeshStandardMaterial({ map: wallTex, roughness: 0.6, side: THREE.DoubleSide });
+  const topMat = new THREE.MeshStandardMaterial({ map: asphalt.map, roughnessMap: asphalt.rough, normalMap: asphalt.normal, normalScale: new THREE.Vector2(0.22, 0.22), roughness: 1, metalness: 0 });
+  // low-frequency patching so the 10 m tile doesn't read as a repeat
+  topMat.onBeforeCompile = (sh) => {
+    sh.fragmentShader = sh.fragmentShader.replace('#include <map_fragment>', `#include <map_fragment>
+      { vec2 q = vec2(vUv.x * 3.0, vUv.y * 0.23); vec2 i = floor(q), f = fract(q); f = f * f * (3.0 - 2.0 * f);
+        float a = fract(sin(dot(i, vec2(127.1, 311.7))) * 43758.5), b = fract(sin(dot(i + vec2(1.0, 0.0), vec2(127.1, 311.7))) * 43758.5);
+        float c = fract(sin(dot(i + vec2(0.0, 1.0), vec2(127.1, 311.7))) * 43758.5), d = fract(sin(dot(i + vec2(1.0, 1.0), vec2(127.1, 311.7))) * 43758.5);
+        diffuseColor.rgb *= 0.86 + 0.26 * mix(mix(a, b, f.x), mix(c, d, f.x), f.y); }`);
+  };
+  const kerbMat = new THREE.MeshStandardMaterial({ map: kerb.map, normalMap: kerb.normal, roughness: 0.62, polygonOffset: true, polygonOffsetFactor: -2 });
+  const slabMat = new THREE.MeshStandardMaterial({ color: 0x9a9ea4, map: slabTex, roughness: 0.9 });
+  const wallMat = new THREE.MeshStandardMaterial({ map: wallTex, roughness: 0.82, side: THREE.DoubleSide });
   for (const run of surfaceRuns()) {
     strip(run, [-HALF_W, 0.02], [HALF_W, 0.02], 10, topMat);
+    strip(run, [-HALF_W, 0.075], [-HALF_W + 1, 0.028], 6, kerbMat, 1, 0);
+    strip(run, [HALF_W - 1, 0.028], [HALF_W, 0.075], 6, kerbMat, 0, 1);
     strip(run, [HALF_W, -0.7], [-HALF_W, -0.7], 10, slabMat);
     strip(run, [-HALF_W - 0.4, -0.7], [-HALF_W - 0.4, 1.0], 10, slabMat);
     strip(run, [HALF_W + 0.4, 1.0], [HALF_W + 0.4, -0.7], 10, slabMat);
@@ -920,6 +1189,27 @@ function mergeGeos(parts) {
   return out;
 }
 const M4 = (x, y, z, sx = 1, sy = 1, sz = 1) => new THREE.Matrix4().compose(new THREE.Vector3(x, y, z), new THREE.Quaternion(), new THREE.Vector3(sx, sy, sz));
+const distCulled = []; // instanced chunks hidden beyond a camera distance
+const shadowProxies = [];
+const lodChunks = []; // instanced chunks that swap to a low-poly geometry when far
+const shadowRefill = { x: 1e9, z: 1e9 };
+function refillShadowProxies(x, z) {
+  if (Math.hypot(x - shadowRefill.x, z - shadowRefill.z) < 12) return;
+  shadowRefill.x = x; shadowRefill.z = z;
+  const R2 = 110 * 110;
+  for (const sp of shadowProxies) {
+    const arr = sp.proxy.instanceMatrix.array, max = sp.proxy.instanceMatrix.count;
+    let n = 0;
+    for (let k = 0; k < sp.list.length && n < max; k++) {
+      const it = sp.list[k], dx = it[0] - x, dz = it[2] - z;
+      if (dx * dx + dz * dz > R2) continue;
+      arr.set(sp.mats.subarray(k * 16, k * 16 + 16), n * 16);
+      n++;
+    }
+    sp.proxy.count = n;
+    sp.proxy.instanceMatrix.needsUpdate = true;
+  }
+}
 
 {
   const steel = new THREE.MeshStandardMaterial({ color: 0xd2d6db, metalness: 0.9, roughness: 0.22 });
@@ -965,7 +1255,13 @@ const M4 = (x, y, z, sx = 1, sy = 1, sz = 1) => new THREE.Matrix4().compose(new 
       for (let x = 0; x < w; x += 3 + r() * 2) { g.fillStyle = cols[Math.floor(r() * cols.length)]; g.fillRect(x, row * 12.8 + 2 + r() * 2, 2.4, 6); }
     }
   }, false);
-  const grey = new THREE.MeshStandardMaterial({ color: 0x5b6068, roughness: 0.8 });
+  const standTex = canvasTex(256, 256, (g, w, h) => {
+    g.fillStyle = '#80848a'; g.fillRect(0, 0, w, h);
+    for (let y = 0; y < h; y += 16) { g.fillStyle = 'rgba(0,0,0,0.28)'; g.fillRect(0, y, w, 3); g.fillStyle = 'rgba(255,255,255,0.08)'; g.fillRect(0, y + 3, w, 2); }
+    for (let x = 0; x < w; x += 64) { g.fillStyle = 'rgba(0,0,0,0.2)'; g.fillRect(x, 0, 3, h); }
+  });
+  standTex.repeat.set(4, 2);
+  const grey = new THREE.MeshStandardMaterial({ color: 0x8a8e94, map: standTex, roughness: 0.85 });
   const seats = new THREE.Mesh(new THREE.BoxGeometry(160, 12, 18), [grey, grey, grey, grey, new THREE.MeshStandardMaterial({ map: crowdTex, roughness: 0.9 }), grey]);
   seats.rotation.x = -0.35;
   seats.position.set(110, 6, -HALF_W - 22);
@@ -986,22 +1282,50 @@ const M4 = (x, y, z, sx = 1, sy = 1, sz = 1) => new THREE.Matrix4().compose(new 
 
   // vegetation: juniper, live oak, scrub, rocks
   const leaf = [0.16, 0.23, 0.08], leafDark = [0.09, 0.15, 0.06], bark = [0.25, 0.16, 0.09];
-  const ico = (r) => new THREE.IcosahedronGeometry(r, 0);
-  const juniper = mergeGeos([
+  // lumpy foliage blobs with soft, jittered normals (reads as leaf mass rather than facets)
+  let blobSeed = 0;
+  const ico = (r, detail = 1) => {
+    const g = new THREE.IcosahedronGeometry(1, detail), sd = (blobSeed += 1.7);
+    const p = g.attributes.position, nr = g.attributes.normal;
+    for (let k = 0; k < p.count; k++) {
+      const x = p.getX(k), y = p.getY(k), z = p.getZ(k);
+      const s = r * (0.8 + vnoise(x * 2.1 + sd, z * 2.1 + y * 1.9) * 0.34);
+      p.setXYZ(k, x * s, y * s, z * s);
+      const j = 0.45;
+      const n = norm([x + (hash2(x * 9.1 + sd, y * 7.3 + z) - 0.5) * j, y + 0.25 + (hash2(y * 5.7, z * 8.1 + sd) - 0.5) * j, z + (hash2(z * 6.3 + x, sd) - 0.5) * j]);
+      nr.setXYZ(k, n[0], n[1], n[2]);
+    }
+    return g;
+  };
+  // darken toward the inside/bottom of the canopy (cheap baked AO), leave bark alone
+  const shadeFoliage = (g) => {
+    const p = g.attributes.position, c = g.attributes.color;
+    let y0 = Infinity, y1 = -Infinity;
+    for (let k = 0; k < p.count; k++) if (c.getY(k) > c.getX(k)) { y0 = Math.min(y0, p.getY(k)); y1 = Math.max(y1, p.getY(k)); }
+    for (let k = 0; k < p.count; k++) {
+      if (c.getY(k) <= c.getX(k)) continue;
+      const t = (p.getY(k) - y0) / Math.max(0.01, y1 - y0);
+      const v = (0.45 + 0.75 * t) * (0.9 + hash2(p.getX(k) * 3.3, p.getZ(k) * 2.9 + p.getY(k)) * 0.2);
+      c.setXYZ(k, c.getX(k) * v * (1.05 - 0.1 * t), c.getY(k) * v, c.getZ(k) * v * (0.9 + 0.1 * t));
+    }
+    return g;
+  };
+  const juniperGeo = (d) => shadeFoliage(mergeGeos([
     [new THREE.CylinderGeometry(0.2, 0.32, 2.2, 6), M4(0, 1.1, 0), bark],
-    [ico(1.7), M4(0, 3.0, 0, 1, 1.25, 1), leafDark],
-    [ico(1.35), M4(0.2, 4.6, -0.1), leafDark],
-    [ico(0.95), M4(-0.1, 5.9, 0.1), leafDark],
-    [ico(0.9), M4(0.9, 3.4, 0.6), leafDark],
-  ]);
-  const oak = mergeGeos([
+    [ico(1.7, d), M4(0, 3.0, 0, 1, 1.25, 1), leafDark],
+    [ico(1.35, d), M4(0.2, 4.6, -0.1), leafDark],
+    [ico(0.95, d), M4(-0.1, 5.9, 0.1), leafDark],
+    [ico(0.9, d), M4(0.9, 3.4, 0.6), leafDark],
+  ]));
+  const oakGeo = (d) => shadeFoliage(mergeGeos([
     [new THREE.CylinderGeometry(0.32, 0.5, 2.6, 7), M4(0, 1.3, 0), bark],
-    [ico(2.4), M4(0, 3.8, 0, 1.4, 0.72, 1.4), leaf],
-    [ico(1.8), M4(1.9, 3.5, 0.9, 1.1, 0.8, 1.1), leaf],
-    [ico(1.7), M4(-1.8, 3.6, -0.7, 1.1, 0.8, 1.1), leaf],
-    [ico(1.5), M4(0.4, 4.6, -1.4, 1.1, 0.8, 1.1), leaf],
-  ]);
-  const scrub = mergeGeos([[ico(1), M4(0, 0.45, 0, 1.3, 0.75, 1.3), leaf], [ico(0.7), M4(0.8, 0.4, 0.3), leaf]]);
+    [ico(2.4, d), M4(0, 3.8, 0, 1.4, 0.72, 1.4), leaf],
+    [ico(1.8, d), M4(1.9, 3.5, 0.9, 1.1, 0.8, 1.1), leaf],
+    [ico(1.7, d), M4(-1.8, 3.6, -0.7, 1.1, 0.8, 1.1), leaf],
+    [ico(1.5, d), M4(0.4, 4.6, -1.4, 1.1, 0.8, 1.1), leaf],
+  ]));
+  const juniper = juniperGeo(1), juniperLo = juniperGeo(0), oak = oakGeo(1), oakLo = oakGeo(0);
+  const scrub = shadeFoliage(mergeGeos([[ico(1, 0), M4(0, 0.45, 0, 1.3, 0.75, 1.3), leaf], [ico(0.7, 0), M4(0.8, 0.4, 0.3), leaf]]));
   const rockGeo = (() => {
     const g = new THREE.DodecahedronGeometry(1, 1);
     const p = g.attributes.position;
@@ -1031,24 +1355,101 @@ const M4 = (x, y, z, sx = 1, sy = 1, sz = 1) => new THREE.Matrix4().compose(new 
     if (!kind || lists[kind].length >= { juniper: 1100, oak: 650, scrub: 1600, rock: 600 }[kind]) continue;
     lists[kind].push([x, groundHeight(x, z), z, 0.7 + r() * 0.7, r() * Math.PI * 2, r()]);
   }
-  const plant = (geo, list, mat, shadow, tint) => {
-    const mesh = new THREE.InstancedMesh(geo, mat, list.length);
-    const m = new THREE.Matrix4(), q = new THREE.Quaternion(), c = new THREE.Color();
-    list.forEach(([x, y, z, s, yaw, v], k) => {
-      q.setFromAxisAngle(new THREE.Vector3(0, 1, 0), yaw);
-      m.compose(new THREE.Vector3(x, y - 0.15, z), q, new THREE.Vector3(s, s * (0.85 + v * 0.3), s));
-      mesh.setMatrixAt(k, m);
-      tint(c, v);
-      mesh.setColorAt(k, c);
-    });
-    mesh.castShadow = shadow; mesh.receiveShadow = true;
-    scene.add(mesh);
+  // Instances are bucketed into world-space chunks, each with a bounding sphere covering its instances,
+  // so the camera frustum can cull them (r149 culls InstancedMesh by the base geometry only).
+  // Shadows come from a small proxy on layer 1 (seen only by the shadow camera), refilled with nearby instances.
+  const plant = (geo, list, mat, shadow, tint, chunk = 600, maxDist = 0, lowGeo = null) => {
+    if (shadow) {
+      const mats = new Float32Array(list.length * 16), mm = new THREE.Matrix4(), qq = new THREE.Quaternion();
+      list.forEach(([x, y, z, s, yaw, v], k) => {
+        qq.setFromAxisAngle(new THREE.Vector3(0, 1, 0), yaw);
+        mm.compose(new THREE.Vector3(x, y - 0.15, z), qq, new THREE.Vector3(s, s * (0.85 + v * 0.3), s));
+        mm.toArray(mats, k * 16);
+      });
+      const proxy = new THREE.InstancedMesh(geo, mat, Math.min(list.length, 600));
+      proxy.count = 0;
+      proxy.castShadow = true;
+      proxy.frustumCulled = false;
+      proxy.layers.set(1);
+      scene.add(proxy);
+      shadowProxies.push({ proxy, list, mats });
+    }
+    geo.computeBoundingSphere();
+    const gr = geo.boundingSphere.radius * 2.2;
+    const buckets = new Map();
+    for (const it of list) {
+      const key = Math.floor(it[0] / chunk) + ',' + Math.floor(it[2] / chunk);
+      if (!buckets.has(key)) buckets.set(key, []);
+      buckets.get(key).push(it);
+    }
+    const m = new THREE.Matrix4(), q = new THREE.Quaternion(), c = new THREE.Color(), va = new THREE.Vector3(), vb = new THREE.Vector3(), vc = new THREE.Vector3();
+    for (const items of buckets.values()) {
+      const cg = new THREE.BufferGeometry();
+      for (const name in geo.attributes) cg.setAttribute(name, geo.attributes[name]);
+      if (geo.index) cg.setIndex(geo.index);
+      const box = new THREE.Box3();
+      for (const it of items) box.expandByPoint(va.set(it[0], it[1], it[2]));
+      cg.boundingSphere = box.getBoundingSphere(new THREE.Sphere());
+      cg.boundingSphere.radius += gr;
+      const mesh = new THREE.InstancedMesh(cg, mat, items.length);
+      items.forEach(([x, y, z, s, yaw, v], k) => {
+        q.setFromAxisAngle(vb.set(0, 1, 0), yaw);
+        m.compose(va.set(x, y - 0.15, z), q, vc.set(s, s * (0.85 + v * 0.3), s));
+        mesh.setMatrixAt(k, m);
+        tint(c, v);
+        mesh.setColorAt(k, c);
+      });
+      mesh.receiveShadow = true;
+      if (maxDist) distCulled.push({ mesh, c: cg.boundingSphere.center, r: cg.boundingSphere.radius + maxDist });
+      if (lowGeo) {
+        const lg = new THREE.BufferGeometry();
+        for (const name in lowGeo.attributes) lg.setAttribute(name, lowGeo.attributes[name]);
+        lg.boundingSphere = cg.boundingSphere;
+        lodChunks.push({ mesh, hi: cg, lo: lg, c: cg.boundingSphere.center, r: cg.boundingSphere.radius });
+      }
+      scene.add(mesh);
+    }
   };
-  const foliage = new THREE.MeshStandardMaterial({ vertexColors: true, flatShading: true, roughness: 0.9 });
-  plant(juniper, lists.juniper, foliage, true, (c, v) => c.setRGB(0.85 + v * 0.3, 0.9 + v * 0.25, 0.8 + v * 0.2));
-  plant(oak, lists.oak, foliage, true, (c, v) => c.setRGB(0.62 + v * 0.3, 0.68 + v * 0.22, 0.55 + v * 0.15));
-  plant(scrub, lists.scrub, foliage, false, (c, v) => c.setRGB(0.8 + v * 0.5, 0.85 + v * 0.3, 0.6 + v * 0.2));
-  plant(rockGeo, lists.rock, foliage, true, (c, v) => c.setRGB(0.8 + v * 0.5, 0.75 + v * 0.4, 0.7 + v * 0.35));
+  const foliage = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.88 });
+  const rockMat = new THREE.MeshStandardMaterial({ vertexColors: true, flatShading: true, roughness: 0.9 });
+  plant(juniper, lists.juniper, foliage, true, (c, v) => c.setRGB(0.8 + v * 0.4, 0.9 + v * 0.3, 0.78 + (1 - v) * 0.3), 300, 0, juniperLo);
+  plant(oak, lists.oak, foliage, true, (c, v) => c.setRGB(0.62 + v * 0.45, 0.7 + v * 0.3, 0.5 + v * 0.1), 300, 0, oakLo);
+  plant(scrub, lists.scrub, foliage, false, (c, v) => c.setRGB(0.8 + v * 0.7, 0.85 + v * 0.4, 0.6 + v * 0.2));
+  plant(rockGeo, lists.rock, rockMat, true, (c, v) => c.setRGB(0.8 + v * 0.5, 0.75 + v * 0.4, 0.7 + v * 0.35));
+
+  // grass tufts along the verges: thin blade fans, base colour dark, tips sun-bleached
+  {
+    const pos = [], col = [], nrm = [];
+    const tr = rng(41);
+    for (let b = 0; b < 14; b++) {
+      const a = (b / 14) * Math.PI * 2 + tr() * 0.8, rad = 0.04 + tr() * 0.32, h = 0.16 + tr() * 0.24, lean = 0.05 + tr() * 0.14;
+      const bx = Math.cos(a) * rad, bz = Math.sin(a) * rad, px = -Math.sin(a) * 0.03, pz = Math.cos(a) * 0.03;
+      const tx = bx + Math.cos(a) * lean, tz = bz + Math.sin(a) * lean;
+      pos.push(bx - px, 0.1, bz - pz, bx + px, 0.1, bz + pz, tx, 0.1 + h, tz);
+      col.push(0.055, 0.085, 0.025, 0.055, 0.085, 0.025, 0.13, 0.16, 0.06);
+      for (let k = 0; k < 3; k++) nrm.push(Math.cos(a) * 0.3, 0.95, Math.sin(a) * 0.3);
+    }
+    const tg = new THREE.BufferGeometry();
+    tg.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    tg.setAttribute('normal', new THREE.Float32BufferAttribute(nrm, 3));
+    tg.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+    const tufts = [];
+    for (let t = 0; t < 200000 && tufts.length < 60000; t++) {
+      const i = Math.floor(tr() * track.N);
+      if (!track.surf[i] || track.P[i * 3 + 1] > 3) continue;
+      const P = fP(i), R = fR(i), side = tr() < 0.5 ? -1 : 1, off = HALF_W + 1.5 + Math.pow(tr(), 1.8) * 50;
+      const x = P[0] + R[0] * side * off + (tr() - 0.5) * 6, z = P[2] + R[2] * side * off + (tr() - 0.5) * 6;
+      if (terrain.distTo(x, z) < HALF_W + 1.2) continue;
+      if (x > 20 && x < 200 && z > -50 && z < -10) continue;
+      const y = groundHeight(x, z);
+      if (y < -0.6) continue;
+      const dry = smoothstep(0.38, 0.62, fbm(x / 160, z / 160, 3));
+      tufts.push([x, y + 0.09, z, 0.6 + tr() * 0.7, tr() * Math.PI * 2, dry]);
+    }
+    const tuftMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.85, side: THREE.DoubleSide });
+    const tr2 = rng(43);
+    plant(tg, tufts, tuftMat, false, (c, v) => { const b = 0.8 + tr2() * 0.45; c.setRGB((1 + v * 1.2) * b, (1 + v * 0.35) * b, (0.9 + v * 0.2) * b); }, 120, 150);
+  }
 
   // distant mesas: layered red sandstone, flat tops
   const mesaMat = new THREE.MeshStandardMaterial({ vertexColors: true, flatShading: true, roughness: 1 });
@@ -1093,7 +1494,7 @@ const shadowTex = canvasTex(128, 64, (g, w, h) => {
 
 function makeCar(color, opts = {}) {
   const grp = new THREE.Group();
-  const paint = new THREE.MeshPhysicalMaterial({ color, metalness: 0.35, roughness: 0.38, clearcoat: 1, clearcoatRoughness: 0.04, envMapIntensity: 0.7 });
+  const paint = new THREE.MeshPhysicalMaterial({ color, metalness: 0.12, roughness: 0.32, clearcoat: 1, clearcoatRoughness: 0.03, envMapIntensity: 0.65 });
   const carbon = new THREE.MeshStandardMaterial({ color: 0x141518, roughness: 0.42, metalness: 0.35 });
   const shape = new THREE.Shape();
   shape.moveTo(2.3, 0.26);
@@ -1124,18 +1525,26 @@ function makeCar(color, opts = {}) {
 
   const part = (geo, mat, x, y, z) => { const m = new THREE.Mesh(geo, mat); m.position.set(x, y, z); m.castShadow = true; grp.add(m); return m; };
   part(new THREE.BoxGeometry(0.5, 0.05, 1.9), carbon, 2.22, 0.22, 0);
-  part(new THREE.BoxGeometry(0.42, 0.2, 1.62), carbon, -2.2, 0.32, 0);
-  for (const z of [-0.5, -0.17, 0.17, 0.5]) part(new THREE.BoxGeometry(0.5, 0.2, 0.03), carbon, -2.25, 0.3, z);
+  // rear: gloss-black fascia, diffuser with strakes
+  const gloss = new THREE.MeshPhysicalMaterial({ color: 0x050607, roughness: 0.18, metalness: 0.1, clearcoat: 1, clearcoatRoughness: 0.05 });
+  part(new THREE.BoxGeometry(0.08, 0.27, 1.56), gloss, -2.45, 0.64, 0);
+  part(new THREE.BoxGeometry(0.1, 0.16, 1.72), carbon, -2.43, 0.25, 0);
+  for (const z of [-0.66, -0.33, 0, 0.33, 0.66]) part(new THREE.BoxGeometry(0.3, 0.2, 0.025), carbon, -2.5, 0.24, z);
   for (const side of [-1, 1]) {
     part(new THREE.BoxGeometry(2.3, 0.1, 0.08), carbon, 0, 0.27, side * 0.98);
     const intake = part(new THREE.BoxGeometry(0.7, 0.16, 0.05), carbon, -0.75, 0.5, side * 0.99);
     intake.rotation.y = side * 0.12;
   }
 
-  const glassMat = new THREE.MeshPhysicalMaterial({ color: 0x080c12, metalness: 0.2, roughness: 0.03, clearcoat: 1, envMapIntensity: 1.8 });
+  const glassMat = new THREE.MeshPhysicalMaterial({ color: 0x020203, metalness: 0.3, roughness: 0.05, clearcoat: 1, envMapIntensity: 0.75 });
   const glass = new THREE.Mesh(new THREE.SphereGeometry(1, 40, 20), glassMat);
-  glass.scale.set(1.5, 0.44, 0.7);
-  glass.position.set(-0.3, 0.84, 0);
+  glass.scale.set(1.42, 0.37, 0.64);
+  glass.position.set(-0.25, 0.83, 0);
+  // headrest fairings behind the canopy
+  for (const z of [-0.3, 0.3]) {
+    const fair = part(new THREE.SphereGeometry(1, 20, 12), paint, -1.25, 0.86, z);
+    fair.scale.set(0.62, 0.17, 0.2);
+  }
   glass.castShadow = true;
   grp.add(glass);
 
@@ -1181,19 +1590,25 @@ function makeCar(color, opts = {}) {
   }
 
   const glow = (col) => new THREE.Sprite(new THREE.SpriteMaterial({ map: dotTex, color: col, blending: THREE.AdditiveBlending, depthWrite: false, transparent: true, opacity: 0.8 }));
-  const tailMat = new THREE.MeshBasicMaterial({ color: 0x8a0f18 });
-  const tail = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.06, 1.55), tailMat);
-  tail.position.set(-2.37, 0.66, 0);
+  // HDR colours (>1) so the post bloom picks the lamps up
+  const tailMat = new THREE.MeshBasicMaterial({ color: new THREE.Color(3, 0.08, 0.1) });
+  const tail = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.035, 1.5), tailMat);
+  tail.position.set(-2.5, 0.73, 0);
   grp.add(tail);
+  for (const z of [-0.74, 0.74]) {
+    const end = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.15, 0.05), tailMat);
+    end.position.set(-2.5, 0.67, z);
+    grp.add(end);
+  }
   const tailGlows = [];
   for (const z of [-0.6, 0, 0.6]) {
     const g = glow(0xff2030);
-    g.position.set(-2.45, 0.66, z); g.scale.set(0.7, 0.35, 1);
-    g.material.opacity = 0.35;
+    g.position.set(-2.56, 0.72, z); g.scale.set(0.9, 0.3, 1);
+    g.material.opacity = 0.3;
     grp.add(g);
     tailGlows.push(g);
   }
-  const headMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+  const headMat = new THREE.MeshBasicMaterial({ color: new THREE.Color(3, 2.9, 2.7) });
   for (const z of [-0.58, 0.58]) {
     const hl = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.05, 0.45), headMat);
     hl.position.set(2.32, 0.5, z); hl.rotation.y = z > 0 ? -0.35 : 0.35;
@@ -1212,22 +1627,34 @@ function makeCar(color, opts = {}) {
 
   let wing = null;
   if (opts.roadster) {
-    wing = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.04, 1.6), carbon);
+    const foil = new THREE.Shape();
+    foil.moveTo(0.24, 0);
+    foil.bezierCurveTo(0.1, 0.035, -0.12, 0.05, -0.22, 0.02);
+    foil.lineTo(-0.24, -0.005);
+    foil.bezierCurveTo(-0.1, -0.012, 0.1, -0.01, 0.24, 0);
+    const foilGeo = new THREE.ExtrudeGeometry(foil, { depth: 1.62, bevelEnabled: false, curveSegments: 10 });
+    foilGeo.translate(0, 0, -0.81);
+    wing = new THREE.Mesh(foilGeo, carbon);
     wing.position.set(-1.98, 1.04, 0);
     wing.castShadow = true;
     grp.add(wing);
-    for (const z of [-0.81, 0.81]) part(new THREE.BoxGeometry(0.5, 0.22, 0.02), carbon, -1.98, 1.0, z);
+    for (const z of [-0.82, 0.82]) part(new THREE.BoxGeometry(0.56, 0.26, 0.018), carbon, -1.98, 1.0, z);
+    for (const z of [-0.36, 0.36]) part(new THREE.BoxGeometry(0.16, 0.2, 0.025), carbon, -1.92, 0.94, z);
   }
 
   const plumes = [];
   if (opts.nozzles) {
-    const nozMat = new THREE.MeshStandardMaterial({ color: 0x9aa3ad, metalness: 0.9, roughness: 0.3 });
-    const nozGeo = new THREE.CylinderGeometry(0.1, 0.13, 0.16, 12); nozGeo.rotateZ(Math.PI / 2);
+    const nozMat = new THREE.MeshStandardMaterial({ color: 0x4a4f56, metalness: 0.95, roughness: 0.32, side: THREE.DoubleSide });
+    const nozGeo = new THREE.LatheGeometry([[0.06, 0], [0.075, 0.03], [0.1, 0.09], [0.125, 0.15], [0.118, 0.16]].map(([a, b]) => new THREE.Vector2(a, b)), 20);
+    nozGeo.rotateZ(Math.PI / 2);
+    const throatGeo = new THREE.CircleGeometry(0.07, 16); throatGeo.rotateY(-Math.PI / 2);
+    const throatMat = new THREE.MeshBasicMaterial({ color: new THREE.Color(0.25, 0.55, 1.1) });
     const plumeGeo = new THREE.ConeGeometry(0.24, 1, 14, 1, true); plumeGeo.rotateZ(Math.PI / 2); plumeGeo.translate(-0.5, 0, 0);
-    const plumeMat = new THREE.MeshBasicMaterial({ color: 0xbfe6ff, transparent: true, opacity: 0.75, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide });
-    for (const z of [-0.62, -0.28, 0.28, 0.62]) {
-      const nz = new THREE.Mesh(nozGeo, nozMat); nz.position.set(-2.4, 0.5, z); grp.add(nz);
-      const pl = new THREE.Mesh(plumeGeo, plumeMat); pl.position.set(-2.46, 0.5, z); pl.visible = false; grp.add(pl);
+    const plumeMat = new THREE.MeshBasicMaterial({ color: new THREE.Color(0.7, 0.95, 1.25), transparent: true, opacity: 0.6, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide });
+    for (const z of [-0.6, -0.27, 0.27, 0.6]) {
+      const nz = new THREE.Mesh(nozGeo, nozMat); nz.position.set(-2.4, 0.46, z); grp.add(nz);
+      const th = new THREE.Mesh(throatGeo, throatMat); th.position.set(-2.42, 0.46, z); grp.add(th);
+      const pl = new THREE.Mesh(plumeGeo, plumeMat); pl.position.set(-2.56, 0.46, z); pl.visible = false; grp.add(pl);
       plumes.push(pl);
     }
   }
@@ -1240,13 +1667,57 @@ function makeCar(color, opts = {}) {
       lifts.push(pl);
     }
   }
+  // collapse static parts into one mesh per material (keeps draw calls per car low)
+  const wheelGroups = new Set(wheels.map((s) => s.parent));
+  mergeStatic(grp, new Set([wing, shadow, ...plumes, ...lifts, ...wheelGroups]));
+  for (const s of wheels) mergeStatic(s, new Set());
   scene.add(grp);
   return { grp, front, wheels, tailMat, tailGlows, shadow, wing, plumes, lifts, spinT: performance.now() / 1000 };
 }
 
+function mergeStatic(root, skip) {
+  root.updateMatrixWorld(true);
+  const inv = new THREE.Matrix4().copy(root.matrixWorld).invert();
+  const byMat = new Map();
+  const visit = (o) => {
+    for (const ch of o.children) {
+      if (skip.has(ch)) continue;
+      if (ch.isMesh && !ch.isInstancedMesh) {
+        if (!byMat.has(ch.material)) byMat.set(ch.material, []);
+        byMat.get(ch.material).push(ch);
+      }
+      if (ch.children.length) visit(ch);
+    }
+  };
+  visit(root);
+  for (const [mat, list] of byMat) {
+    if (list.length < 2) continue;
+    const geos = list.map((m) => {
+      const g = m.geometry.index ? m.geometry.toNonIndexed() : m.geometry.clone();
+      g.applyMatrix4(new THREE.Matrix4().multiplyMatrices(inv, m.matrixWorld));
+      return g;
+    });
+    const names = ['position', 'normal', 'uv'].filter((n) => geos.every((g) => g.attributes[n]));
+    const out = new THREE.BufferGeometry();
+    for (const n of names) {
+      const size = geos[0].attributes[n].itemSize;
+      const arr = new Float32Array(geos.reduce((s, g) => s + g.attributes[n].count * size, 0));
+      let o = 0;
+      for (const g of geos) { arr.set(g.attributes[n].array, o); o += g.attributes[n].array.length; }
+      out.setAttribute(n, new THREE.BufferAttribute(arr, size));
+    }
+    const merged = new THREE.Mesh(out, mat);
+    merged.castShadow = list.some((m) => m.castShadow);
+    merged.receiveShadow = list.some((m) => m.receiveShadow);
+    for (const m of list) m.parent.remove(m);
+    for (const g of geos) g.dispose();
+    root.add(merged);
+  }
+}
+
 function setBrakeLights(m, on) {
-  m.tailMat.color.setHex(on ? 0xff2a3a : 0x8a0f18);
-  for (const g of m.tailGlows) g.material.opacity = on ? 0.95 : 0.35;
+  if (on) m.tailMat.color.setRGB(9, 0.3, 0.35); else m.tailMat.color.setRGB(3, 0.08, 0.1);
+  for (const g of m.tailGlows) g.material.opacity = on ? 0.95 : 0.3;
 }
 
 function spinWheels(m, speed) {
@@ -1265,7 +1736,7 @@ const pData = [];
 const pGeo = new THREE.BufferGeometry();
 pGeo.setAttribute('position', new THREE.BufferAttribute(pPos, 3));
 pGeo.setAttribute('color', new THREE.BufferAttribute(pCol, 3));
-const pMesh = new THREE.Points(pGeo, new THREE.PointsMaterial({ size: 1.6, map: dotTex, vertexColors: true, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, sizeAttenuation: true }));
+const pMesh = new THREE.Points(pGeo, new THREE.PointsMaterial({ size: 1.6, map: dotTex, vertexColors: true, transparent: true, opacity: 0.5, depthWrite: false, blending: THREE.AdditiveBlending, sizeAttenuation: true }));
 pMesh.frustumCulled = false;
 scene.add(pMesh);
 let pHead = 0;
@@ -1294,6 +1765,7 @@ function updateParticles(dt) {
 const audio = {
   ctx: null,
   muted: store.get('muted') === true,
+  musicOn: store.get('music') !== false,
   unlock() {
     if (this.ctx) { if (this.ctx.state === 'suspended') this.ctx.resume(); return; }
     try {
@@ -1304,65 +1776,185 @@ const audio = {
   },
   build() {
     const c = this.ctx;
-    this.master = c.createGain(); this.master.gain.value = 0.5; this.master.connect(c.destination);
-    this.m1 = c.createOscillator(); this.m1.type = 'sawtooth';
-    this.m2 = c.createOscillator(); this.m2.type = 'sine';
-    this.mf = c.createBiquadFilter(); this.mf.type = 'lowpass'; this.mf.frequency.value = 1400; this.mf.Q.value = 3;
+    const comp = c.createDynamicsCompressor();
+    comp.threshold.value = -20; comp.knee.value = 12; comp.ratio.value = 4; comp.attack.value = 0.005; comp.release.value = 0.25;
+    const lim = c.createDynamicsCompressor();
+    lim.threshold.value = -3; lim.knee.value = 0; lim.ratio.value = 20; lim.attack.value = 0.002; lim.release.value = 0.1;
+    const tone = c.createBiquadFilter(); tone.type = 'lowpass'; tone.frequency.value = 9000; tone.Q.value = 0.5;
+    this.master = c.createGain(); this.master.gain.value = this.muted ? 0 : 0.8;
+    this.master.connect(tone); tone.connect(comp); comp.connect(lim); lim.connect(c.destination);
+    this.mf = c.createBiquadFilter(); this.mf.type = 'lowpass'; this.mf.frequency.value = 400; this.mf.Q.value = 0.7;
     this.mg = c.createGain(); this.mg.gain.value = 0;
-    this.m1.connect(this.mf); this.m2.connect(this.mf); this.mf.connect(this.mg); this.mg.connect(this.master);
-    this.m1.start(); this.m2.start();
-    const buf = c.createBuffer(1, c.sampleRate * 2, c.sampleRate);
-    const d = buf.getChannelData(0);
-    for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    this.mf.connect(this.mg); this.mg.connect(this.master);
+    const mo = (type, vol) => {
+      const o = c.createOscillator(), g = c.createGain(); o.type = type; g.gain.value = vol;
+      o.connect(g); g.connect(this.mf); o.start(); return o;
+    };
+    this.m1 = mo('sine', 0.6); this.m2 = mo('triangle', 0.3); this.m3 = mo('sine', 0.18);
+    const len = c.sampleRate * 2;
+    this.white = c.createBuffer(1, len, c.sampleRate); this.brown = c.createBuffer(1, len, c.sampleRate);
+    const w = this.white.getChannelData(0), b = this.brown.getChannelData(0);
+    for (let i = 0, last = 0; i < len; i++) {
+      w[i] = Math.random() * 2 - 1;
+      last = (last + 0.02 * w[i]) / 1.02; b[i] = last * 3.5;
+    }
     const mk = (type, freq, q) => {
-      const s = c.createBufferSource(); s.buffer = buf; s.loop = true;
+      const s = c.createBufferSource(); s.buffer = this.brown; s.loop = true;
       const f = c.createBiquadFilter(); f.type = type; f.frequency.value = freq; f.Q.value = q;
       const g = c.createGain(); g.gain.value = 0;
       s.connect(f); f.connect(g); g.connect(this.master); s.start();
-      return g.gain;
+      return { g: g.gain, f };
     };
-    this.hiss = mk('bandpass', 3200, 0.5);
-    this.wind = mk('lowpass', 450, 0.4);
-    this.fan = mk('bandpass', 950, 4);
-    this.skid = mk('bandpass', 1700, 7);
-    this.scrape = mk('bandpass', 4200, 3);
+    this.whoosh = mk('lowpass', 750, 0.5);
+    this.wind = mk('lowpass', 300, 0.3);
+    this.fan = mk('bandpass', 280, 1.2);
+    this.skid = mk('bandpass', 520, 1.5);
+    this.scrape = mk('lowpass', 900, 0.7);
+    this.buildMusic();
   },
   update(p) {
     if (!this.ctx || !this.master) return;
     const t = this.ctx.currentTime;
-    const set = (param, v) => param.setTargetAtTime(v, t, 0.05);
-    const live = !this.muted && p && (state === 'race' || state === 'countdown' || state === 'results');
+    const set = (param, v, k = 0.06) => param.setTargetAtTime(v, t, k);
+    set(this.master.gain, this.muted ? 0 : 0.8, 0.03);
+    const live = p && (state === 'race' || state === 'countdown' || state === 'results');
     const m = live ? 1 : 0;
     const sp = p ? vlen(p.V) : 0;
     const air = p && p.mode === 'air';
-    set(this.m1.frequency, 38 + sp * 9);
-    set(this.m2.frequency, 76 + sp * 18);
-    set(this.mg.gain, m * (0.02 + 0.055 * input.throttle * (air ? 0.3 : 1) + sp * 0.00035));
-    set(this.hiss, m * ((p && p.boosting ? 0.32 : 0) + (p && p.lifting ? 0.38 : 0)));
-    set(this.wind, m * Math.min(0.22, sp * sp * 0.00003));
-    set(this.fan, m * (p && p.aero === 0 ? 0.035 : 0.012));
-    set(this.skid, m * (p && !air && p.slip > 3 ? Math.min(0.14, (p.slip - 3) * 0.02) : 0));
-    set(this.scrape, m * (p && p.scraping > 0 ? 0.12 : 0));
+    const thr = input.throttle * (air ? 0.3 : 1);
+    set(this.m1.frequency, 42 + sp * 0.9);
+    set(this.m2.frequency, 70 + sp * 3.2);
+    set(this.m3.frequency, 140 + sp * 6.4);
+    set(this.mf.frequency, Math.min(1800, 380 + sp * 9 + thr * 250));
+    set(this.mg.gain, m * (0.05 + 0.09 * thr + Math.min(0.06, sp * 0.0008)));
+    set(this.whoosh.g, m * ((p && p.boosting ? 0.22 : 0) + (p && p.lifting ? 0.26 : 0)), 0.08);
+    set(this.whoosh.f.frequency, p && p.boosting ? 1100 : 750);
+    set(this.wind.g, m * Math.min(0.2, sp * sp * 0.00004));
+    set(this.wind.f.frequency, Math.min(1400, 250 + sp * 10));
+    set(this.fan.g, m * (p && (p.suction || p.diving) ? 0.12 : 0.02));
+    set(this.skid.g, m * (p && !air && p.slip > 4 ? Math.min(0.12, (p.slip - 4) * 0.015) : 0), 0.08);
+    set(this.scrape.g, m * (p && p.scraping > 0 ? 0.1 : 0));
+    this.music(t);
+  },
+  // ---- music: 118 BPM synthwave in A minor, 8-bar loop of 16th steps
+  bpm: 118,
+  chords: [[33, 57, 60, 64], [29, 57, 60, 65], [36, 55, 60, 64], [31, 55, 59, 62], [33, 57, 60, 64], [29, 57, 60, 65], [31, 55, 59, 62], [28, 56, 59, 64]],
+  arpSeq: [0, 1, 2, 3, 2, 1, 0, 1, 0, 1, 2, 3, 2, 3, 1, 2],
+  hz: (n) => 440 * Math.pow(2, (n - 69) / 12),
+  buildMusic() {
+    const c = this.ctx;
+    this.six = 60 / this.bpm / 4;
+    this.mus = c.createGain(); this.mus.gain.value = 0;
+    this.musLP = c.createBiquadFilter(); this.musLP.type = 'lowpass'; this.musLP.frequency.value = 12000; this.musLP.Q.value = 0.5;
+    this.mus.connect(this.musLP); this.musLP.connect(this.master);
+    this.padF = c.createBiquadFilter(); this.padF.type = 'lowpass'; this.padF.frequency.value = 1000; this.padF.Q.value = 0.6;
+    this.padF.connect(this.mus);
+    this.arpBus = c.createGain(); this.arpBus.connect(this.mus);
+    const dly = c.createDelay(1), fb = c.createGain(), dlf = c.createBiquadFilter(), wet = c.createGain();
+    dly.delayTime.value = this.six * 3; fb.gain.value = 0.32; wet.gain.value = 0.35;
+    dlf.type = 'lowpass'; dlf.frequency.value = 1800;
+    this.arpBus.connect(dly); dly.connect(dlf); dlf.connect(fb); fb.connect(dly); dlf.connect(wet); wet.connect(this.mus);
+    this.step = 0; this.next = 0;
+  },
+  music(t) {
+    const mode = state === 'paused' ? 'pause' : state === 'results' ? 'results' : state === 'title' ? 'title' : 'race';
+    const on = this.musicOn && !this.muted;
+    this.mus.gain.setTargetAtTime(on ? (mode === 'pause' ? 0.12 : mode === 'race' ? 0.2 : 0.26) : 0, t, 0.3);
+    this.musLP.frequency.setTargetAtTime(mode === 'pause' ? 600 : 12000, t, 0.2);
+    if (!on) { this.next = 0; return; }
+    if (!this.next) { this.next = t + 0.05; this.step = 0; }
+    if (this.next < t - 0.1) this.next = t + 0.02;
+    while (this.next < t + 0.2) {
+      this.note(this.step, this.next, mode === 'pause' ? 'race' : mode);
+      this.next += this.six; this.step = (this.step + 1) % 128;
+    }
+  },
+  note(s, w, mode) {
+    const bar = s >> 4, b = s & 15, ch = this.chords[bar], six = this.six;
+    const drums = mode !== 'results';
+    if (b === 0) for (let i = 1; i < 4; i++) this.pad(this.hz(ch[i]), w, six * 16, mode === 'results' ? 0.06 : 0.045);
+    if (drums && b % 4 === 0) this.kick(w, mode === 'title' ? 0.45 : 0.8);
+    if (drums && b % 4 === 2) this.hat(w, mode === 'title' ? 0.03 : 0.05);
+    if (mode === 'race' && (b === 4 || b === 12)) this.snare(w, 0.12);
+    if (mode === 'race' && bar === 7 && b >= 13) this.snare(w, 0.04 + (b - 13) * 0.025);
+    if (b % 2 === 0) this.bass(this.hz(ch[0] + (b % 4 === 2 ? 12 : 0)), w, six * 1.7, mode === 'results' ? 0.18 : 0.3);
+    if (mode !== 'title' || bar >= 4 || b % 2 === 0) {
+      const k = this.arpSeq[b];
+      this.arp(this.hz((k === 3 ? ch[1] + 12 : ch[k + 1]) + 12), w, six * 0.9, mode === 'results' ? 0.05 : 0.07);
+    }
+  },
+  osc(type, f, w, dest) {
+    const o = this.ctx.createOscillator(), g = this.ctx.createGain();
+    o.type = type; o.frequency.setValueAtTime(f, w); g.gain.setValueAtTime(0, w);
+    o.connect(g); g.connect(dest); return [o, g.gain];
+  },
+  pad(f, w, dur, vol) {
+    for (const det of [-7, 7]) {
+      const [o, g] = this.osc('sawtooth', f, w, this.padF);
+      o.detune.value = det;
+      g.linearRampToValueAtTime(vol, w + 0.35); g.setValueAtTime(vol, w + dur - 0.1); g.linearRampToValueAtTime(0, w + dur + 0.4);
+      o.start(w); o.stop(w + dur + 0.45);
+    }
+  },
+  bass(f, w, dur, vol) {
+    const c = this.ctx, lp = c.createBiquadFilter();
+    lp.type = 'lowpass'; lp.Q.value = 2; lp.frequency.setValueAtTime(900, w); lp.frequency.exponentialRampToValueAtTime(200, w + 0.15);
+    lp.connect(this.mus);
+    for (const [type, v] of [['sawtooth', vol], ['sine', vol * 0.8]]) {
+      const [o, g] = this.osc(type, f, w, lp);
+      g.linearRampToValueAtTime(v, w + 0.005); g.exponentialRampToValueAtTime(0.0001, w + dur);
+      o.start(w); o.stop(w + dur + 0.02);
+    }
+  },
+  arp(f, w, dur, vol) {
+    const [o, g] = this.osc('triangle', f, w, this.arpBus);
+    g.linearRampToValueAtTime(vol, w + 0.004); g.exponentialRampToValueAtTime(0.0001, w + dur);
+    o.start(w); o.stop(w + dur + 0.02);
+  },
+  kick(w, vol) {
+    const [o, g] = this.osc('sine', 130, w, this.mus);
+    o.frequency.exponentialRampToValueAtTime(45, w + 0.12);
+    g.linearRampToValueAtTime(vol, w + 0.003); g.exponentialRampToValueAtTime(0.0001, w + 0.35);
+    o.start(w); o.stop(w + 0.4);
+  },
+  noise(w, dur, vol, type, freq, q) {
+    const c = this.ctx, s = c.createBufferSource(), f = c.createBiquadFilter(), g = c.createGain();
+    s.buffer = this.white; f.type = type; f.frequency.value = freq; f.Q.value = q;
+    g.gain.setValueAtTime(0, w); g.gain.linearRampToValueAtTime(vol, w + 0.002); g.gain.exponentialRampToValueAtTime(0.0001, w + dur);
+    s.connect(f); f.connect(g); g.connect(this.mus); s.start(w, Math.random() * 1.5); s.stop(w + dur + 0.02);
+  },
+  hat(w, vol) { this.noise(w, 0.04, vol, 'bandpass', 7500, 0.8); },
+  snare(w, vol) {
+    this.noise(w, 0.16, vol, 'bandpass', 1800, 0.7);
+    const [o, g] = this.osc('triangle', 180, w, this.mus);
+    g.linearRampToValueAtTime(vol * 0.8, w + 0.003); g.exponentialRampToValueAtTime(0.0001, w + 0.08);
+    o.start(w); o.stop(w + 0.1);
   },
   beep(freq, dur, vol = 0.18) {
     if (!this.ctx || this.muted) return;
-    const c = this.ctx, o = c.createOscillator(), g = c.createGain();
-    o.type = 'square'; o.frequency.value = freq;
-    g.gain.setValueAtTime(vol, c.currentTime);
-    g.gain.exponentialRampToValueAtTime(0.001, c.currentTime + dur);
-    o.connect(g); g.connect(this.master); o.start(); o.stop(c.currentTime + dur + 0.02);
+    const w = this.ctx.currentTime;
+    for (const [type, f, v] of [['triangle', freq, vol], ['sine', freq / 2, vol * 0.6]]) {
+      const [o, g] = this.osc(type, f, w, this.master);
+      g.linearRampToValueAtTime(v, w + 0.008); g.exponentialRampToValueAtTime(0.0001, w + dur);
+      o.start(w); o.stop(w + dur + 0.02);
+    }
   },
   thud(vol = 0.4) {
     if (!this.ctx || this.muted) return;
-    const c = this.ctx, o = c.createOscillator(), g = c.createGain();
-    o.type = 'sine';
-    o.frequency.setValueAtTime(110, c.currentTime);
-    o.frequency.exponentialRampToValueAtTime(35, c.currentTime + 0.25);
-    g.gain.setValueAtTime(vol, c.currentTime);
-    g.gain.exponentialRampToValueAtTime(0.001, c.currentTime + 0.3);
-    o.connect(g); g.connect(this.master); o.start(); o.stop(c.currentTime + 0.32);
+    const c = this.ctx, w = c.currentTime, [o, g] = this.osc('sine', 90, w, this.master);
+    o.frequency.exponentialRampToValueAtTime(32, w + 0.25);
+    g.linearRampToValueAtTime(vol * 0.8, w + 0.006); g.exponentialRampToValueAtTime(0.0001, w + 0.3);
+    o.start(w); o.stop(w + 0.32);
+    const s = c.createBufferSource(), f = c.createBiquadFilter(), ng = c.createGain();
+    s.buffer = this.brown; f.type = 'lowpass'; f.frequency.value = 250;
+    ng.gain.setValueAtTime(vol * 0.5, w); ng.gain.exponentialRampToValueAtTime(0.0001, w + 0.18);
+    s.connect(f); f.connect(ng); ng.connect(this.master); s.start(w, Math.random() * 1.5); s.stop(w + 0.2);
   },
 };
+document.addEventListener('visibilitychange', () => {
+  if (!audio.ctx) return;
+  if (document.hidden) audio.ctx.suspend(); else audio.ctx.resume();
+});
 
 // ============================================================
 // Input — keyboard + Xbox controller (standard Gamepad mapping)
@@ -1381,9 +1973,9 @@ const KEY_ACTIONS = {
   ArrowUp: 'up', KeyW: 'up', ArrowDown: 'down', KeyS: 'down',
   ArrowLeft: 'left', KeyA: 'left', ArrowRight: 'right', KeyD: 'right',
   Enter: 'confirm', Space: 'confirm', Escape: 'pause', KeyP: 'pause', Backspace: 'back',
-  KeyF: 'aero', KeyR: 'reset', KeyT: 'restart', KeyM: 'mute', KeyC: 'camera',
+  KeyR: 'reset', KeyT: 'restart', KeyM: 'mute', KeyN: 'music', KeyC: 'camera',
 };
-const PAD_ACTIONS = { 0: 'confirm', 1: 'back', 3: 'aero', 4: 'camera', 5: 'camera', 8: 'restart', 9: 'pause', 12: 'up', 13: 'down', 14: 'left', 15: 'right' };
+const PAD_ACTIONS = { 0: 'confirm', 1: 'back', 4: 'camera', 5: 'camera', 8: 'restart', 9: 'pause', 12: 'up', 13: 'down', 14: 'left', 15: 'right' };
 
 window.addEventListener('keydown', (e) => {
   if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space', 'Backspace'].includes(e.code)) e.preventDefault();
@@ -1513,7 +2105,7 @@ function makePlayer(trim) {
   const p = {
     trim, mode: 'track', s: L - back, lat: mode === 'race' ? 3.5 : 0, psi: 0, u: 0, v: 0,
     P: [0, 0, 0], V: [0, 0, 0], F: [1, 0, 0], Up: [0, 1, 0],
-    gas: trim.tank, gasIdle: 0, aero: 0, steerVis: 0, slip: 0, load: G * 2, scraping: 0,
+    gas: trim.tank, gasIdle: 0, suction: false, fell: false, loopWarned: false, steerVis: 0, slip: 0, load: G * 2, scraping: 0,
     lap: 0, visited: new Array(SECTORS).fill(true), lapStart: 0,
     lastLap: null, bestLap: store.get('best.' + trim.id), lapTimes: [],
     boosting: false, lifting: false, braking: false, inverted: false,
@@ -1633,18 +2225,26 @@ function gasLogic(p, inp, dt) {
 function stepTrack(p, inp, dt) {
   const T = p.trim;
   const f = frameAt(p.s);
-  const hiDF = p.aero === 0;
+  const hiDF = p.suction = inp.dive && !p.lifting;
   let c = Math.cos(p.psi), s = Math.sin(p.psi);
   let vs = p.u * c - p.v * s;
   const speed = Math.hypot(p.u, p.v);
-  const fan = p.lifting ? 0 : (hiDF ? 1.0 : 0.5) * G;
-  const aero = p.lifting ? 0 : (hiDF ? 0.003 : 0.0011) * speed * speed;
+  const inLoop = track.tag[Math.floor(p.s)] === 'loop';
+  const fan = p.lifting ? 0 : (hiDF ? 1.3 : inLoop ? 0 : 0.5) * G;
+  const aero = p.lifting ? 0 : (hiDF ? 0.003 : 0.0025) * speed * speed;
   const N = vs * vs * f.kn + G * f.U[1] + fan + aero - (p.lifting ? LIFT_A : 0);
   p.load = N;
   p.inverted = f.U[1] < -0.2;
 
-  if (!f.surf || N < 0) {
+  const loopSoon = track.tag[Math.floor(wrapS(p.s + 60))] === 'loop';
+  if (loopSoon && !inLoop && !p.loopWarned && p === player && !hiDF && speed < 34) { p.loopWarned = true; toast('Loop ahead — hold Y so the fans keep you on', 'warn'); }
+  if (!loopSoon && !inLoop) p.loopWarned = false;
+
+  const stalled = inLoop && !hiDF && !p.lifting && f.U[1] < 0.3 && speed < 5;
+  if (!f.surf || N < 0 || stalled) {
+    const fell = (p.inverted || stalled) && !p.lifting;
     detach(p);
+    p.fell = fell;
     if (p.lifting) p.V = madd(p.V, p.Up, LIFT_POP);
     stepAir(p, inp, dt);
     return;
@@ -1739,7 +2339,7 @@ function stepTrack(p, inp, dt) {
   p.gLong = lerp(p.gLong, (aTire + aThrust) / G, 0.08);
   p.gLat = lerp(p.gLat, (yaw * u) / G, 0.08);
 
-  if (track.tag[Math.floor(p.s)] === 'loop') p.loopEntry = true;
+  if (inLoop) p.loopEntry = true;
   else if (p.loopEntry) { p.loopEntry = false; p.loops++; toast('Loop! Fans held you through the top', 'good'); }
 }
 
@@ -1750,6 +2350,18 @@ function detach(p) {
   p.mode = 'air';
   p.airTime = 0; p.maxAlt = 0;
   p.inverted = false;
+  p.loopEntry = false;
+}
+
+function crash(p, msg) {
+  p.V = [0, 0, 0];
+  p.fell = false;
+  if (p.offCourse > 0) return;
+  p.offCourse = 1.2;
+  toast(msg, 'warn');
+  rumble(1, 0.8, 350, true);
+  audio.thud(0.6);
+  shake = Math.max(shake, 1);
 }
 
 function stepAir(p, inp, dt) {
@@ -1814,21 +2426,15 @@ function stepAir(p, inp, dt) {
   const along = dot(d, Ti);
   const overTrack = track.surf[i] && Math.abs(along) < 1.5 && Math.abs(lat) < HALF_W - 0.2;
   if (p.airTime > 0.15 && overTrack && h < 0.15 && h > -2.5 && dot(p.V, Ui) < 2) {
-    land(p, i, d, lat);
+    if (p.fell) crash(p, 'Fell off upside down — hold Y for suction');
+    else land(p, i, d, lat);
     return;
   }
   // off course: hit the ground
   const gy = groundHeight(p.P[0], p.P[2]) + 0.32;
   if (p.P[1] < gy && !(overTrack && h > -2.5)) {
     p.P[1] = gy;
-    p.V = [0, 0, 0];
-    if (p.offCourse <= 0) {
-      p.offCourse = 1.2;
-      toast('Off course — returning to track', 'warn');
-      rumble(1, 0.8, 350, true);
-      audio.thud(0.6);
-      shake = Math.max(shake, 1);
-    }
+    crash(p, p.fell ? 'Fell off upside down — hold Y for suction' : 'Off course — returning to track');
   }
 }
 
@@ -1868,9 +2474,13 @@ function resetToTrack(p, silent = false) {
   let s = p.mode === 'air' ? p.lastTrackS : p.s;
   const j = jumpAt(s);
   if (j) s = j.kick - 110;
+  if (track.tag[Math.floor(wrapS(s))] === 'loop') {
+    while (track.tag[Math.floor(wrapS(s))] === 'loop') s -= 5;
+    s -= 40;
+  }
   while (!track.surf[Math.floor(wrapS(s))]) s -= 5;
   p.s = wrapS(s); p.lat = clamp(p.lat, -3, 3); p.psi = 0; p.u = 0; p.v = 0;
-  p.mode = 'track'; p.offCourse = 0; p.resetCooldown = 1;
+  p.mode = 'track'; p.offCourse = 0; p.resetCooldown = 1; p.fell = false;
   syncTrackPose(p);
   if (!silent) toast('Reset to track');
 }
@@ -2073,6 +2683,7 @@ function handleActions() {
   while (actions.length) {
     const a = actions.shift();
     if (a === 'mute') { audio.muted = !audio.muted; store.set('muted', audio.muted); toast(audio.muted ? 'Sound off' : 'Sound on'); continue; }
+    if (a === 'music') { audio.musicOn = !audio.musicOn; store.set('music', audio.musicOn); toast(audio.musicOn ? (audio.muted ? 'Music on (sound muted — M)' : 'Music on') : 'Music off'); continue; }
     if (a === 'camera') { camMode = (camMode + 1) % 3; toast(['Chase cam', 'Far chase cam', 'Hood cam'][camMode]); continue; }
 
     if (state === 'title') {
@@ -2080,11 +2691,7 @@ function handleActions() {
       else if (a === 'confirm') startRace();
     } else if (state === 'race' || state === 'countdown') {
       if (a === 'pause') pauseGame();
-      else if (a === 'aero' && player && player.mode === 'track') {
-        player.aero = player.aero === 0 ? 1 : 0;
-        toast(player.aero === 0 ? 'High downforce — fans max (holds upside down)' : 'Low drag — fans eco, wing flat');
-        rumble(0.2, 0.3, 80, true);
-      } else if (a === 'reset' && state === 'race' && player && !player.finished) resetToTrack(player);
+      else if (a === 'reset' && state === 'race' && player && !player.finished) resetToTrack(player);
       else if (a === 'restart') startRace();
     } else if (state === 'paused') {
       const items = ['resume', 'restart', 'menu'];
@@ -2148,7 +2755,7 @@ function renderOverlay() {
           <tr><td>RT / LT</td><td>Throttle / brake (analog) · LT at rest = reverse</td></tr>
           <tr><td>${X('A', 'a')} hold</td><td>Cold-gas thrusters — boost</td></tr>
           <tr><td>${X('X', 'x')} hold</td><td>Lift thrusters — hop barriers, fly</td></tr>
-          <tr><td>${X('Y', 'y')}</td><td>Aero: high downforce ↔ low drag · hold in the air to dive</td></tr>
+          <tr><td>${X('Y', 'y')}</td><td>hold — suction fans: grip, stay on upside down · dive in the air</td></tr>
           <tr><td>D-pad ↑</td><td>Reset to track</td></tr>
           <tr><td>${X('B', 'b')}</td><td>Back (menus)</td></tr>
           <tr><td>LB / RB</td><td>Change camera</td></tr>
@@ -2159,9 +2766,9 @@ function renderOverlay() {
           <tr><td><kbd>↑</kbd><kbd>↓</kbd> or <kbd>W</kbd><kbd>S</kbd></td><td>Throttle / brake · reverse</td></tr>
           <tr><td><kbd>Space</kbd></td><td>Cold-gas thrusters</td></tr>
           <tr><td><kbd>Shift</kbd> / <kbd>E</kbd></td><td>Lift thrusters — fly</td></tr>
-          <tr><td><kbd>F</kbd> · <kbd>C</kbd></td><td>Aero mode (hold in the air to dive) · camera</td></tr>
+          <tr><td><kbd>F</kbd> · <kbd>C</kbd></td><td>Hold for suction fans / dive · camera</td></tr>
           <tr><td><kbd>R</kbd> · <kbd>T</kbd></td><td>Reset to track · restart</td></tr>
-          <tr><td><kbd>Esc</kbd> · <kbd>M</kbd></td><td>Pause · mute</td></tr>
+          <tr><td><kbd>Esc</kbd> · <kbd>M</kbd> · <kbd>N</kbd></td><td>Pause · mute · music</td></tr>
         </table></div>
       </div>
       ${padStatusHTML()}
@@ -2234,7 +2841,7 @@ function syncScene() {
   setBrakeLights(m, p.braking || input.brake > 0.2);
   if (p.mode === 'track') spinWheels(m, p.u); else m.spinT = performance.now() / 1000;
   m.shadow.visible = p.mode === 'track';
-  if (m.wing) m.wing.rotation.z = p.aero === 0 ? 0.32 : 0.04;
+  if (m.wing) m.wing.rotation.z = p.suction || p.diving ? 0.32 : 0.04;
   for (const pl of m.plumes) { pl.visible = p.boosting; pl.scale.set(3 + Math.sin(t * 60 + pl.position.z * 9) * 0.8 + Math.random(), 1, 1); }
   for (const pl of m.lifts) { pl.visible = p.lifting; pl.scale.set(1, 2.5 + Math.random() * 1.2, 1); }
 }
@@ -2270,8 +2877,14 @@ function updateCamera(dt) {
   camera.fov = cam.fov;
   camera.updateProjectionMatrix();
 
-  sun.position.set(P[0] + SUN_DIR[0] * 200, P[1] + SUN_DIR[1] * 200, P[2] + SUN_DIR[2] * 200);
-  sun.target.position.set(P[0], P[1], P[2]);
+  // centre the shadow frustum a little ahead of the car, where the chase cam is looking
+  camera.getWorldDirection(_v2);
+  const sc = [P[0] + _v2.x * 22, P[1] + _v2.y * 22, P[2] + _v2.z * 22];
+  sun.position.set(sc[0] + SUN_DIR[0] * 200, sc[1] + SUN_DIR[1] * 200, sc[2] + SUN_DIR[2] * 200);
+  sun.target.position.set(sc[0], sc[1], sc[2]);
+  for (const d of distCulled) d.mesh.visible = d.c.distanceToSquared(camera.position) < d.r * d.r;
+  refillShadowProxies(sc[0], sc[2]);
+  for (const d of lodChunks) d.mesh.geometry = d.c.distanceTo(camera.position) - d.r > 140 ? d.lo : d.hi;
   scene.userData.sky.position.copy(camera.position);
   scene.userData.sky.material.uniforms.cloudShift.value = performance.now() * 0.000004;
 }
@@ -2339,8 +2952,8 @@ function drawPlayerHUD() {
   text('MPH', cx, cy + 32, 11, '#9aa0a8', 'center', 600);
   let label, col;
   if (p.mode === 'air') { label = p.diving ? 'DIVE · FANS PULLING DOWN' : p.diveHeld ? 'DIVE · WAITING FOR TRACK BELOW' : `AIRBORNE · ${p.airTime.toFixed(1)} s`; col = '#7cf7ff'; }
-  else if (p.inverted) { label = 'UPSIDE DOWN · FANS HOLDING'; col = '#ff9f43'; }
-  else { label = p.aero === 0 ? 'HIGH DOWNFORCE' : 'LOW DRAG'; col = p.aero === 0 ? '#9fd4ff' : '#f2c230'; }
+  else if (p.inverted) { label = p.suction ? 'UPSIDE DOWN · FANS HOLDING' : 'UPSIDE DOWN · HOLD Y!'; col = p.suction ? '#ff9f43' : '#ff5a5a'; }
+  else { label = p.suction ? 'SUCTION · FANS MAX' : 'LOW DRAG'; col = p.suction ? '#9fd4ff' : '#f2c230'; }
   text(label, cx, cy + 62, 11, col, 'center', 700);
 
   // G meter + load (left of the speedo when there's room, otherwise above the minimap)
@@ -2411,8 +3024,8 @@ function drawPlayerHUD() {
   drawMinimap();
 
   const hint = lastDevice === 'pad'
-    ? 'RT throttle · LT brake · A thrusters · X lift · Y aero/dive · D-pad ↑ reset · LB/RB camera · ☰ pause'
-    : '↑ throttle · ↓ brake · Space thrusters · Shift lift · F aero · C camera · R reset · Esc pause';
+    ? 'RT throttle · LT brake · A thrusters · X lift · Y suction/dive · D-pad ↑ reset · LB/RB camera · ☰ pause'
+    : '↑ throttle · ↓ brake · Space thrusters · Shift lift · F suction/dive · C camera · R reset · Esc pause';
   text(hint, W / 2, H - 6, 11, 'rgba(255,255,255,0.55)', 'center', 500);
 
   if (state === 'countdown' || goFlash > 0) {
@@ -2424,7 +3037,7 @@ function drawPlayerHUD() {
       ctx.beginPath(); ctx.arc(lx + 5 + i * 70, ly, 20, 0, Math.PI * 2); ctx.fill();
     }
     if (goFlash > 0) text('GO', W / 2, ly + 80, 48, '#27e06b', 'center', 900);
-    else if (countdown > 3) text(`Hold ${lastDevice === 'pad' ? 'RT' : '↑'} at green · launch in HIGH DOWNFORCE`, W / 2, ly + 66, 14, '#fff', 'center', 600);
+    else if (countdown > 3) text(`Hold ${lastDevice === 'pad' ? 'RT' : '↑'} at green · hold ${lastDevice === 'pad' ? 'Y' : 'F'} for suction grip`, W / 2, ly + 66, 14, '#fff', 'center', 600);
   }
   if (p.offCourse > 0) text('OFF COURSE', W / 2, H * 0.45, 40, '#ffb347', 'center', 900);
 }
@@ -2542,7 +3155,8 @@ function tick(now) {
   if (state !== 'paused') updateParticles(dt);
   syncScene();
   updateCamera(dt);
-  renderer.render(scene, camera);
+  post.render(scene, camera);
+  trackPerf(dt);
   drawHUD();
   audio.update(player);
 }
