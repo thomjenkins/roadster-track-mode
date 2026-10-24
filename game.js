@@ -1508,7 +1508,7 @@ function cityGround(x, z) {
   return a === 2 || b === 2 || (a === 1 && b === 1) ? CITY.CURB : 0;
 }
 
-const city = { built: false, group: null, blocks: [], cells: new Map(), walls: [] };
+const city = { built: false, group: null, blocks: [], cells: new Map(), walls: [], signals: [], signalLamps: null, signalHalos: null, carMeshes: [], traffic: [] };
 const cityCell = (c) => Math.floor((c - CITY.MIN) / CITY.PITCH);
 const cellKey = (i, j) => (i + 2) * 100 + (j + 2);
 function addSolid(x0, z0, x1, z1, h) {
@@ -1811,6 +1811,52 @@ function buildCity() {
   ]);
   inst(treeGeo, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.9, flatShading: true }), trees);
 
+  // traffic signals: a mast-arm signal on the far-right corner of every approach, hanging over its lanes
+  const sigGeo = mergeGeos([
+    [new THREE.CylinderGeometry(0.1, 0.13, 6, 8), M4(0, 3, 0), [0.2, 0.21, 0.23]],
+    [new THREE.BoxGeometry(0.14, 0.14, 5), M4(0, 5.85, 2.5), [0.2, 0.21, 0.23]],
+    [new THREE.BoxGeometry(0.42, 1.36, 0.5), M4(0.1, 5.2, 4.6), [0.12, 0.12, 0.13]],
+    [new THREE.BoxGeometry(0.05, 1.7, 0.8), M4(-0.13, 5.2, 4.6), [0.06, 0.06, 0.07]],
+  ]);
+  const sigMats = [], up = new THREE.Vector3(0, 1, 0), one = new THREE.Vector3(1, 1, 1);
+  for (let i = 0; i <= B; i++) for (let j = 0; j <= B; j++) {
+    for (const [dx, dz, ok] of [[1, 0, i > 0], [-1, 0, i < B], [0, 1, j > 0], [0, -1, j < B]]) {
+      if (!ok) continue;
+      const px = roadLine(i) - dz * (h + 0.9) + dx * (h + 0.9), pz = roadLine(j) + dx * (h + 0.9) + dz * (h + 0.9);
+      const m = new THREE.Matrix4().compose(new THREE.Vector3(px, CURB, pz), new THREE.Quaternion().setFromAxisAngle(up, Math.atan2(dz, -dx)), one);
+      sigMats.push(m);
+      addSolid(px - 0.2, pz - 0.2, px + 0.2, pz + 0.2, 6);
+      city.signals.push({ i, j, alongX: dx !== 0, m, shown: '' });
+    }
+  }
+  inst(sigGeo, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.55, metalness: 0.5 }), sigMats);
+  // bulbs plus a soft additive halo in front of each, so the lit lamp reads from a block away
+  const n = city.signals.length * 3;
+  const bulbs = city.signalLamps = new THREE.InstancedMesh(new THREE.SphereGeometry(0.2, 12, 8), new THREE.MeshBasicMaterial({ color: 0xffffff }), n);
+  const halos = city.signalHalos = new THREE.InstancedMesh(new THREE.PlaneGeometry(1.3, 1.3).rotateY(Math.PI / 2), new THREE.MeshBasicMaterial({ map: dotTex, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending }), n);
+  const local = new THREE.Matrix4(), off = new THREE.Color().setRGB(...SIG_OFF), dark = new THREE.Color(0, 0, 0);
+  city.signals.forEach((s, k) => {
+    [5.65, 5.2, 4.75].forEach((y, li) => {
+      bulbs.setMatrixAt(k * 3 + li, local.makeTranslation(0.32, y, 4.6).premultiply(s.m));
+      halos.setMatrixAt(k * 3 + li, local.makeTranslation(0.5, y, 4.6).premultiply(s.m));
+      bulbs.setColorAt(k * 3 + li, off); // creates instanceColor before the first render
+      halos.setColorAt(k * 3 + li, dark);
+    });
+  });
+  for (const m of [bulbs, halos]) { m.frustumCulled = false; grp.add(m); }
+
+  // traffic: one instanced mesh per body style, recoloured per car
+  const carMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.42, metalness: 0.25 });
+  city.carMeshes = TRAFFIC_STYLES.map((style) => {
+    const m = new THREE.InstancedMesh(trafficGeo(style), carMat, TRAFFIC_N);
+    m.count = 0;
+    for (let k = 0; k < TRAFFIC_N; k++) m.setColorAt(k, new THREE.Color(1, 1, 1));
+    m.castShadow = true; m.receiveShadow = true;
+    m.frustumCulled = false;
+    grp.add(m);
+    return m;
+  });
+
   city.built = true;
 }
 
@@ -1824,6 +1870,56 @@ function setWorld(cityOn) {
     else o.visible = o.userData.wasVisible;
   }
   city.group.visible = cityOn;
+}
+
+// Signals cycle per intersection: roads along x get the first half, roads along z the second,
+// each with green, yellow, then a short all-red. Offsets stagger neighbouring intersections.
+const SIG = { cycle: 26, green: 10, yellow: 2.5 };
+function signalAt(i, j, alongX, t) {
+  const ph = (((t + i * 4 + j * 9) % SIG.cycle) + SIG.cycle) % SIG.cycle;
+  const local = alongX ? ph : (ph + SIG.cycle / 2) % SIG.cycle;
+  return local < SIG.green ? 'g' : local < SIG.green + SIG.yellow ? 'y' : 'r';
+}
+const SIG_ON = { r: [4, 0.25, 0.15], y: [4, 2.4, 0.2], g: [0.3, 3.4, 1.6] };
+const SIG_OFF = [0.1, 0.09, 0.08];
+function updateSignalLamps(t) {
+  const bulbs = city.signalLamps, halos = city.signalHalos, c = new THREE.Color();
+  let dirty = false;
+  for (let k = 0; k < city.signals.length; k++) {
+    const s = city.signals[k], st = signalAt(s.i, s.j, s.alongX, t);
+    if (st === s.shown) continue;
+    s.shown = st; dirty = true;
+    ['r', 'y', 'g'].forEach((col, li) => {
+      const on = col === st;
+      bulbs.setColorAt(k * 3 + li, c.setRGB(...(on ? SIG_ON[col] : SIG_OFF)));
+      halos.setColorAt(k * 3 + li, on ? c.setRGB(...SIG_ON[col]).multiplyScalar(0.3) : c.setRGB(0, 0, 0));
+    });
+  }
+  if (dirty) { bulbs.instanceColor.needsUpdate = true; halos.instanceColor.needsUpdate = true; }
+}
+
+// Traffic car bodies: local +X forward, +Z right, wheels on y = 0. Paint is white so instance colours tint it.
+const TRAFFIC_N = 44;
+const TRAFFIC_STYLES = ['sedan', 'suv', 'van'];
+const TRAFFIC_PAINT = [[0.92, 0.92, 0.9], [0.62, 0.64, 0.67], [0.1, 0.1, 0.11], [0.6, 0.06, 0.06], [0.08, 0.2, 0.5], [0.12, 0.3, 0.18], [0.95, 0.72, 0.08], [0.72, 0.64, 0.5]];
+function trafficGeo(style) {
+  const PAINT = [1, 1, 1], GLASS = [0.05, 0.06, 0.07], TYRE = [0.04, 0.04, 0.04], HEAD = [1, 1, 0.95], TAIL = [0.9, 0.06, 0.05];
+  const [L, H, W] = style === 'van' ? [5.4, 1.7, 2.0] : style === 'suv' ? [4.8, 0.95, 1.95] : [4.5, 0.72, 1.84];
+  const y0 = 0.22, parts = [[new THREE.BoxGeometry(L, H, W), M4(0, y0 + H / 2, 0), PAINT]];
+  if (style === 'van') parts.push([new THREE.BoxGeometry(0.9, H * 0.42, W * 1.01), M4(L / 2 - 0.5, y0 + H * 0.72, 0), GLASS]);
+  else {
+    const [cl, ch, cx] = style === 'suv' ? [2.9, 0.72, -0.35] : [2.3, 0.58, -0.25];
+    parts.push([new THREE.BoxGeometry(cl, ch, W * 0.88), M4(cx, y0 + H + ch / 2, 0), GLASS]);
+    parts.push([new THREE.BoxGeometry(cl * 0.86, 0.07, W * 0.9), M4(cx, y0 + H + ch, 0), PAINT]);
+  }
+  for (const sx of [-1, 1]) for (const sz of [-1, 1]) {
+    parts.push([new THREE.CylinderGeometry(0.34, 0.34, 0.26, 12), new THREE.Matrix4().makeRotationX(Math.PI / 2).setPosition(sx * L * 0.32, 0.34, sz * (W / 2 - 0.08)), TYRE]);
+  }
+  for (const sz of [-1, 1]) {
+    parts.push([new THREE.BoxGeometry(0.06, 0.13, 0.36), M4(L / 2, y0 + H * 0.62, sz * W * 0.32), HEAD]);
+    parts.push([new THREE.BoxGeometry(0.06, 0.13, 0.4), M4(-L / 2, y0 + H * 0.62, sz * W * 0.32), TAIL]);
+  }
+  return mergeGeos(parts);
 }
 
 // ============================================================
@@ -2513,6 +2609,7 @@ function startRace() {
   setWorld(mode === 'city');
   player = mode === 'city' ? makeCityPlayer(ROADSTER) : makePlayer(ROADSTER);
   rivals = mode === 'race' ? makeRivals() : [];
+  if (mode === 'city') spawnTraffic();
   raceTime = 0; simClock = 0; countdown = 4; lastLights = -1; goFlash = 0; finishTimer = 0;
   toasts.length = 0;
   camInit = false;
@@ -3009,6 +3106,248 @@ function resetToStreet(p, silent = false) {
   if (!silent) toast('Back on the street');
 }
 
+// ---------- city traffic: lane-following cars that stop for signals and for whatever is ahead ----------
+// A car drives toward junction (ni, nj) along d with signed distance a (negative before the centre) and
+// lateral offset off to its right. At the junction it goes straight, or turns on a quarter circle.
+const LANE_IN = CITY.LANE / 2, LANE_OUT = CITY.LANE * 1.5;
+const STOP_A = -(CITY.ROAD_W / 2 + 4.5) - 2.3; // car centre when its nose is at the stop line
+const RIGHT_R = 6, LEFT_R = CITY.ROAD_W / 2 + LANE_IN;
+const inGrid = (i, j) => i >= 0 && j >= 0 && i <= CITY.BLOCKS && j <= CITY.BLOCKS;
+
+function chooseTurn(c) {
+  const [dx, dz] = c.d, rx = -dz, rz = dx;
+  const opts = [];
+  if (inGrid(c.ni + dx, c.nj + dz)) opts.push(['S', 0.55]);
+  if (inGrid(c.ni + rx, c.nj + rz)) opts.push(['R', 0.25]);
+  if (inGrid(c.ni - rx, c.nj - rz)) opts.push(['L', 0.2]);
+  let x = Math.random() * opts.reduce((s, o) => s + o[1], 0);
+  c.next = opts[opts.length - 1][0];
+  for (const [o, w] of opts) if ((x -= w) <= 0) { c.next = o; break; }
+  if (c.next === 'R') c.offT = LANE_OUT;
+  else if (c.next === 'L') c.offT = LANE_IN;
+}
+
+function poseLane(c) {
+  const [dx, dz] = c.d;
+  c.P[0] = roadLine(c.ni) + dx * c.a - dz * c.off;
+  c.P[1] = roadLine(c.nj) + dz * c.a + dx * c.off;
+  c.psi = Math.atan2(dz, dx) + c.laneYaw;
+}
+function poseTurn(c) {
+  const [dx, dz] = c.d, rx = -dz, rz = dx;
+  const A = c.tac + c.tr * Math.cos(c.phi), Bq = c.tbc + c.tr * Math.sin(c.phi);
+  c.P[0] = roadLine(c.ni) + dx * A + rx * Bq;
+  c.P[1] = roadLine(c.nj) + dz * A + rz * Bq;
+  // tangent of a right turn (phi increasing) is d·(−sin φ) + R·cos φ; a left turn runs the other way
+  const ta = -Math.sin(c.phi) * c.tdir, tb = Math.cos(c.phi) * c.tdir;
+  c.psi = Math.atan2(dz * ta + rz * tb, dx * ta + rx * tb);
+}
+function startTurn(c) {
+  if (c.next === 'R') { c.tr = RIGHT_R; c.tac = -LANE_OUT - RIGHT_R; c.tbc = c.off + RIGHT_R; c.phi = -Math.PI / 2; c.tdir = 1; }
+  else { c.tr = LEFT_R; c.tac = LANE_IN - LEFT_R; c.tbc = c.off - LEFT_R; c.phi = Math.PI / 2; c.tdir = -1; }
+  c.state = 'turn';
+  c.laneYaw = 0;
+}
+function finishTurn(c) {
+  const [dx, dz] = c.d;
+  const nd = c.tdir > 0 ? [-dz, dx] : [dz, -dx];
+  c.d = nd; c.ni += nd[0]; c.nj += nd[1];
+  const rx = c.P[0] - roadLine(c.ni), rz = c.P[1] - roadLine(c.nj);
+  c.a = rx * nd[0] + rz * nd[1];
+  c.off = c.offT = c.tdir > 0 ? LANE_OUT : LANE_IN;
+  c.state = 'lane';
+  chooseTurn(c);
+}
+
+// distance between bumpers to the nearest car (or the player) in a narrow cone ahead; remembers who it was
+function gapAhead(c) {
+  const fx = Math.cos(c.psi), fz = Math.sin(c.psi);
+  let best = Infinity;
+  c.blocker = null;
+  for (let k = -1; k < city.traffic.length; k++) {
+    let x, z, o;
+    if (k < 0) { if (!player || player.P[1] > 2) continue; o = player; x = player.P[0]; z = player.P[2]; }
+    else { o = city.traffic[k]; if (o === c) continue; x = o.P[0]; z = o.P[1]; }
+    const rx = x - c.P[0], rz = z - c.P[1], along = rx * fx + rz * fz;
+    if (along <= 0 || along > 40 || Math.abs(rz * fx - rx * fz) > 2) continue;
+    if (along - 4.8 < best) { best = along - 4.8; c.blocker = o; }
+  }
+  return best;
+}
+// nobody (car, wreck or player) in the lane at offset `off` from 8 m behind to 12 m ahead of c
+function laneClear(c, off) {
+  const [dx, dz] = c.d, cx = roadLine(c.ni), cz = roadLine(c.nj);
+  const busy = (x, z) => {
+    const rx = x - cx, rz = z - cz, a = rx * dx + rz * dz;
+    return Math.abs(rz * dx - rx * dz - off) < 2 && a > c.a - 8 && a < c.a + 12;
+  };
+  if (player && player.P[1] < 2 && busy(player.P[0], player.P[2])) return false;
+  for (const o of city.traffic) if (o !== c && busy(o.P[0], o.P[1])) return false;
+  return true;
+}
+// a car coming the other way that a left turner must wait for
+function oncoming(c) {
+  for (const o of city.traffic) {
+    if (o.state !== 'lane' || o.ni !== c.ni || o.nj !== c.nj || o.next === 'L') continue;
+    if (o.d[0] === -c.d[0] && o.d[1] === -c.d[1] && o.a > -45 && o.a < CITY.ROAD_W / 2) return true;
+  }
+  return false;
+}
+
+function placeTraffic(c, x0, z0, minD, maxD) {
+  const B = CITY.BLOCKS, h = CITY.ROAD_W / 2;
+  for (let tries = 0; tries < 40; tries++) {
+    const ni = Math.floor(Math.random() * (B + 1)), nj = Math.floor(Math.random() * (B + 1));
+    const d = [[1, 0], [-1, 0], [0, 1], [0, -1]][Math.floor(Math.random() * 4)];
+    if (!inGrid(ni - d[0], nj - d[1])) continue;
+    Object.assign(c, { ni, nj, d, a: lerp(-CITY.PITCH + h + 10, -h - 24, Math.random()), off: Math.random() < 0.5 ? LANE_IN : LANE_OUT, laneYaw: 0 });
+    c.offT = c.off;
+    poseLane(c);
+    const dist = Math.hypot(c.P[0] - x0, c.P[1] - z0);
+    if (dist < minD || dist > maxD) continue;
+    if (city.traffic.some((o) => o !== c && o.P && Math.hypot(o.P[0] - c.P[0], o.P[1] - c.P[1]) < 12)) continue;
+    break;
+  }
+  Object.assign(c, { state: 'lane', v: c.cruise * 0.8, V: [0, 0], w: 0, knockT: 0, stuck: 0, ignoreT: 0, braking: false });
+  chooseTurn(c);
+  poseLane(c);
+}
+
+function spawnTraffic() {
+  city.traffic = [];
+  const paint = new THREE.Color();
+  for (let k = 0; k < TRAFFIC_N; k++) {
+    const c = { k, style: k % TRAFFIC_STYLES.length, idx: Math.floor(k / TRAFFIC_STYLES.length), cruise: 10 + Math.random() * 4, recycleT: Math.random(), P: null };
+    c.P = [0, 0];
+    placeTraffic(c, player.P[0], player.P[2], 30, 420);
+    city.traffic.push(c);
+    city.carMeshes[c.style].setColorAt(c.idx, paint.setRGB(...TRAFFIC_PAINT[Math.floor(Math.random() * TRAFFIC_PAINT.length)]));
+  }
+  city.carMeshes.forEach((m, s) => { m.count = city.traffic.filter((c) => c.style === s).length; m.instanceColor.needsUpdate = true; });
+}
+
+function stepKnocked(c, dt) {
+  const k = Math.exp(-1.6 * dt);
+  c.V[0] *= k; c.V[1] *= k;
+  c.w *= Math.exp(-2.5 * dt);
+  c.P[0] += c.V[0] * dt; c.P[1] += c.V[1] * dt;
+  c.psi += c.w * dt;
+  for (const b of solidsNear(c.P[0], c.P[1], _solids)) {
+    if (b.h < 1) continue;
+    const qx = clamp(c.P[0], b.x0, b.x1), qz = clamp(c.P[1], b.z0, b.z1), dx = c.P[0] - qx, dz = c.P[1] - qz, d = Math.hypot(dx, dz);
+    if (d >= 1.6 || d < 1e-6) continue;
+    const nx = dx / d, nz = dz / d, vn = c.V[0] * nx + c.V[1] * nz;
+    c.P[0] += nx * (1.6 - d); c.P[1] += nz * (1.6 - d);
+    if (vn < 0) { c.V[0] -= nx * vn * 1.3; c.V[1] -= nz * vn * 1.3; }
+  }
+  c.v = Math.hypot(c.V[0], c.V[1]);
+  c.knockT += dt;
+}
+
+function stepTraffic(dt) {
+  const h = CITY.ROAD_W / 2;
+  for (const c of city.traffic) {
+    c.recycleT -= dt;
+    if (c.recycleT <= 0) {
+      c.recycleT = 1 + Math.random();
+      const far = Math.hypot(c.P[0] - player.P[0], c.P[1] - player.P[2]);
+      if (far > 340 || (c.state === 'knocked' && c.knockT > 8 && far > 40)) { placeTraffic(c, player.P[0], player.P[2], 120, 300); continue; }
+    }
+    if (c.state === 'knocked') { stepKnocked(c, dt); continue; }
+
+    let vT = c.state === 'turn' ? 7 : c.cruise;
+    if (c.state === 'lane' && c.next !== 'S') vT = Math.min(vT, 7 + Math.max(0, (c.next === 'R' ? -LANE_OUT - RIGHT_R : -h) - c.a) * 0.35);
+    const gap = c.ignoreT > 0 ? Infinity : gapAhead(c);
+    vT = Math.min(vT, Math.max(0, gap - 2.5) * 0.9);
+    // a wreck or the player stopped in our lane: move over if the other lane is free
+    const b = c.blocker;
+    if (c.state === 'lane' && gap < 12 && b && (b === player || b.state === 'knocked') && c.a < STOP_A - 6) {
+      const other = c.offT > CITY.LANE ? LANE_IN : LANE_OUT;
+      if (laneClear(c, other)) c.offT = other;
+    }
+    let held = false;
+    if (c.state === 'lane') {
+      const dist = STOP_A - c.a;
+      if (dist > -0.3) {
+        const sig = signalAt(c.ni, c.nj, c.d[0] !== 0, simClock);
+        if (sig === 'r' || (sig === 'y' && dist > (c.v * c.v) / 8) || (c.next === 'L' && dist < 4 && oncoming(c))) {
+          vT = Math.min(vT, Math.sqrt(10 * Math.max(0, dist)));
+          held = true;
+        }
+      }
+    }
+    c.braking = vT < c.v - 0.2 || (held && c.v < 0.5);
+    c.v = c.v < vT ? Math.min(vT, c.v + 2.8 * dt) : Math.max(vT, c.v - 9 * dt);
+    // nose-to-nose standoffs (not at a red light): after a while, creep through
+    if (c.v < 0.3 && !held && gap < 6) { c.stuck += dt; if (c.stuck > 5) { c.ignoreT = 1.5; c.stuck = 0; } } else c.stuck = 0;
+    c.ignoreT = Math.max(0, c.ignoreT - dt);
+
+    if (c.state === 'lane') {
+      c.a += c.v * dt;
+      const prev = c.off;
+      if (c.off === c.offT || laneClear(c, c.offT)) c.off = approach(c.off, c.offT, 1.3 * dt); // merge only into a gap
+      c.laneYaw = Math.atan2((c.off - prev) / dt, Math.max(c.v, 2));
+      if (c.next === 'R' && c.a >= -LANE_OUT - RIGHT_R) startTurn(c);
+      else if (c.next === 'L' && c.a >= -h) startTurn(c);
+      else if (c.next === 'S' && c.a > h + 0.5) { c.ni += c.d[0]; c.nj += c.d[1]; c.a -= CITY.PITCH; chooseTurn(c); }
+      if (c.state === 'lane') poseLane(c); else poseTurn(c);
+    } else {
+      c.phi += c.tdir * (c.v / c.tr) * dt;
+      if (c.tdir * c.phi >= 0) { c.phi = 0; poseTurn(c); finishTurn(c); poseLane(c); }
+      else poseTurn(c);
+    }
+  }
+}
+
+// Player against traffic: circle pairs along each car. Slow nudges bounce off; real hits knock the car loose.
+// Hopping clears them.
+function trafficCollide(p) {
+  if (p.P[1] > 1.7) return 0;
+  let worst = 0;
+  const pc = Math.cos(p.psi), ps = Math.sin(p.psi);
+  for (const c of city.traffic) {
+    const dx0 = p.P[0] - c.P[0], dz0 = p.P[2] - c.P[1];
+    if (dx0 * dx0 + dz0 * dz0 > 49) continue;
+    const cc = Math.cos(c.psi), cs = Math.sin(c.psi);
+    for (const po of [1.4, -1.4]) for (const co of [1.3, -1.3]) {
+      const ax = p.P[0] + pc * po, az = p.P[2] + ps * po, bx = c.P[0] + cc * co, bz = c.P[1] + cs * co;
+      let nx = ax - bx, nz = az - bz;
+      const d = Math.hypot(nx, nz), rs = 2.15;
+      if (d >= rs || d < 1e-6) continue;
+      nx /= d; nz /= d;
+      const knocked = c.state === 'knocked';
+      p.P[0] += nx * (rs - d) * (knocked ? 0.6 : 1); p.P[2] += nz * (rs - d) * (knocked ? 0.6 : 1);
+      if (knocked) { c.P[0] -= nx * (rs - d) * 0.4; c.P[1] -= nz * (rs - d) * 0.4; }
+      const cvx = knocked ? c.V[0] : cc * c.v, cvz = knocked ? c.V[1] : cs * c.v;
+      const vrel = (p.V[0] - cvx) * nx + (p.V[2] - cvz) * nz;
+      if (vrel >= 0) continue;
+      if (!knocked && vrel > -2) { p.V[0] -= nx * vrel * 1.2; p.V[2] -= nz * vrel * 1.2; continue; }
+      if (!knocked) { c.state = 'knocked'; c.V = [cvx, cvz]; c.w = 0; c.knockT = 0; c.braking = true; c.laneYaw = 0; }
+      const j = (-1.2 * vrel) / (1 + 1 / 1.3);
+      p.V[0] += nx * j; p.V[2] += nz * j;
+      c.V[0] -= (nx * j) / 1.3; c.V[1] -= (nz * j) / 1.3;
+      c.w = clamp(c.w + ((bx - c.P[0]) * -nz + (bz - c.P[1]) * nx) * j * 0.05, -3, 3);
+      p.psi = wrapAngle(p.psi + clamp(((ax - p.P[0]) * nz - (az - p.P[2]) * nx) * j * 0.012, -0.3, 0.3));
+      worst = Math.max(worst, -vrel);
+    }
+  }
+  if (worst > 0) {
+    if (worst > 6) { shake = Math.max(shake, 0.3 + Math.min(0.9, worst * 0.03)); rumble(0.8, 0.7, 220, true); audio.thud(0.25 + Math.min(0.4, worst * 0.015)); }
+    else rumble(0.3, 0.4, 100);
+    if (p.mode !== 'air') { const R = cityPose(p); p.u = dot(p.V, p.F); p.v = dot(p.V, R); }
+  }
+  return worst;
+}
+
+const _tm = new THREE.Matrix4(), _tq = new THREE.Quaternion(), _tp = new THREE.Vector3(), _ts = new THREE.Vector3(1, 1, 1), _ty = new THREE.Vector3(0, 1, 0);
+function syncTraffic() {
+  for (const c of city.traffic) {
+    _tm.compose(_tp.set(c.P[0], 0, c.P[1]), _tq.setFromAxisAngle(_ty, -c.psi), _ts);
+    city.carMeshes[c.style].setMatrixAt(c.idx, _tm);
+  }
+  for (const m of city.carMeshes) m.instanceMatrix.needsUpdate = true;
+}
+
 function stepPlayer(p, inp, dt) {
   if (p.offCourse > 0) {
     p.offCourse -= dt;
@@ -3165,6 +3504,8 @@ function simStep(dt) {
   const auto = { steer: 0, throttle: 0, brake: 0.35, boost: false, lift: false, dive: false };
   stepPlayer(player, player.finished ? auto : input, dt);
   if (player.city) {
+    stepTraffic(dt);
+    trafficCollide(player);
     const sp = Math.hypot(player.V[0], player.V[2]);
     player.topSpeed = Math.max(player.topSpeed, sp);
     player.dist += sp * dt;
@@ -3277,7 +3618,7 @@ function renderOverlay() {
       <div class="row focus"><div class="modes">
         <div class="mode ${mode === 'race' ? 'sel' : ''}" data-act="mode:race"><b>Race</b><span>${RACE_LAPS} laps against 3 electric hypercars</span></div>
         <div class="mode ${mode === 'trial' ? 'sel' : ''}" data-act="mode:trial"><b>Time Trial</b><span>Open track — chase your best lap and 0–60</span></div>
-        <div class="mode ${mode === 'city' ? 'sel' : ''}" data-act="mode:city"><b>City</b><span>Free-roam downtown streets — lift is a short hop here</span></div>
+        <div class="mode ${mode === 'city' ? 'sel' : ''}" data-act="mode:city"><b>City</b><span>Downtown streets with traffic and signals — lift is a short hop here</span></div>
       </div></div>
       <button class="start" data-act="start">START · ${X('A', 'a')} / Enter</button>
       <div class="help">
@@ -3359,6 +3700,7 @@ function placeModel(model, P, F, Up) {
 
 function syncScene() {
   const t = performance.now() / 1000;
+  if (cityActive) { syncTraffic(); updateSignalLamps(simClock); }
   for (const r of rivals) {
     placeModel(r.model, r.P, r.F, r.Up);
     setBrakeLights(r.model, r.braking);
@@ -3662,6 +4004,8 @@ function drawCityMap() {
   ctx.fillStyle = 'rgba(22,24,29,0.92)';
   ctx.fillRect(X(-e), Y(-e), 2 * e * sc, (e - o) * sc); ctx.fillRect(X(-e), Y(o), 2 * e * sc, (e - o) * sc);
   ctx.fillRect(X(-e), Y(-e), (e - o) * sc, 2 * e * sc); ctx.fillRect(X(o), Y(-e), (e - o) * sc, 2 * e * sc);
+  ctx.fillStyle = 'rgba(235,238,242,0.85)';
+  for (const c of city.traffic) { ctx.beginPath(); ctx.arc(X(c.P[0]), Y(c.P[1]), 2, 0, Math.PI * 2); ctx.fill(); }
   const cx = X(p.P[0]), cy = Y(p.P[2]), fx = p.F[0], fz = p.F[2];
   ctx.fillStyle = '#e31937'; ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5;
   ctx.beginPath();
