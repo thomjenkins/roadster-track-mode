@@ -1508,7 +1508,10 @@ function cityGround(x, z) {
   return a === 2 || b === 2 || (a === 1 && b === 1) ? CITY.CURB : 0;
 }
 
-const city = { built: false, group: null, blocks: [], cells: new Map(), walls: [], signals: [], signalLamps: null, signalHalos: null, carMeshes: [], traffic: [] };
+const city = {
+  built: false, group: null, blocks: [], cells: new Map(), walls: [],
+  signals: [], signalLamps: null, signalHalos: null, carMeshes: [], traffic: [], pedMeshes: null, peds: [],
+};
 const cityCell = (c) => Math.floor((c - CITY.MIN) / CITY.PITCH);
 const cellKey = (i, j) => (i + 2) * 100 + (j + 2);
 function addSolid(x0, z0, x1, z1, h) {
@@ -1857,6 +1860,27 @@ function buildCity() {
     return m;
   });
 
+  // pedestrians: shirt (torso + arms), head, and legs (two instances each so they can swing)
+  const pedMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.8 });
+  const W1 = [1, 1, 1];
+  const pedMesh = (geo, n) => {
+    const m = new THREE.InstancedMesh(geo, pedMat, n);
+    m.count = 0;
+    for (let k = 0; k < n; k++) m.setColorAt(k, new THREE.Color(1, 1, 1));
+    m.castShadow = true; m.frustumCulled = false;
+    grp.add(m);
+    return m;
+  };
+  city.pedMeshes = {
+    torso: pedMesh(mergeGeos([
+      [new THREE.BoxGeometry(0.24, 0.62, 0.4), M4(0, 1.22, 0), W1],
+      [new THREE.BoxGeometry(0.11, 0.6, 0.11), M4(0, 1.2, -0.26), W1],
+      [new THREE.BoxGeometry(0.11, 0.6, 0.11), M4(0, 1.2, 0.26), W1],
+    ]), PED_N),
+    head: pedMesh(mergeGeos([[new THREE.SphereGeometry(0.125, 12, 8), M4(0, 1.67, 0), W1]]), PED_N),
+    legs: pedMesh(mergeGeos([[new THREE.BoxGeometry(0.15, 0.9, 0.17), M4(0, -0.45, 0), W1]]), PED_N * 2),
+  };
+
   city.built = true;
 }
 
@@ -1875,10 +1899,18 @@ function setWorld(cityOn) {
 // Signals cycle per intersection: roads along x get the first half, roads along z the second,
 // each with green, yellow, then a short all-red. Offsets stagger neighbouring intersections.
 const SIG = { cycle: 26, green: 10, yellow: 2.5 };
-function signalAt(i, j, alongX, t) {
+function sigLocal(i, j, alongX, t) {
   const ph = (((t + i * 4 + j * 9) % SIG.cycle) + SIG.cycle) % SIG.cycle;
-  const local = alongX ? ph : (ph + SIG.cycle / 2) % SIG.cycle;
+  return alongX ? ph : (ph + SIG.cycle / 2) % SIG.cycle;
+}
+function signalAt(i, j, alongX, t) {
+  const local = sigLocal(i, j, alongX, t);
   return local < SIG.green ? 'g' : local < SIG.green + SIG.yellow ? 'y' : 'r';
+}
+// pedestrians start across a road only in the first few seconds of its red, so they're over before green
+function walkSignal(i, j, alongX, t) {
+  const l = sigLocal(i, j, alongX, t) - SIG.green - SIG.yellow;
+  return l > 0.3 && l < 4;
 }
 const SIG_ON = { r: [4, 0.25, 0.15], y: [4, 2.4, 0.2], g: [0.3, 3.4, 1.6] };
 const SIG_OFF = [0.1, 0.09, 0.08];
@@ -2594,7 +2626,7 @@ function makeCityPlayer(trim) {
     P: [roadLine(1) + CITY.PITCH / 2, 0, roadLine(5) + CITY.LANE / 2], V: [0, 0, 0], F: [1, 0, 0], Up: [0, 1, 0],
     gas: trim.tank, gasIdle: 0, suction: false, diving: false, diveHeld: false, steerVis: 0, slip: 0, load: G * 1.5,
     scraping: 0, scrapeSide: 1, boosting: false, lifting: false, braking: false, inverted: false,
-    finished: false, offCourse: 0, resetCooldown: 0, hopT: 0, hopHeld: false, hops: 0, topSpeed: 0, dist: 0,
+    finished: false, offCourse: 0, resetCooldown: 0, hopT: 0, hopHeld: false, hops: 0, topSpeed: 0, dist: 0, pedHits: 0,
     launchStart: null, best060: store.get('z60.' + trim.id), last060: null,
     gLong: 0, gLat: 0, peakG: 0, airTime: 0, maxAlt: 0,
   };
@@ -2609,7 +2641,7 @@ function startRace() {
   setWorld(mode === 'city');
   player = mode === 'city' ? makeCityPlayer(ROADSTER) : makePlayer(ROADSTER);
   rivals = mode === 'race' ? makeRivals() : [];
-  if (mode === 'city') spawnTraffic();
+  if (mode === 'city') { spawnTraffic(); spawnPeds(); }
   raceTime = 0; simClock = 0; countdown = 4; lastLights = -1; goFlash = 0; finishTimer = 0;
   toasts.length = 0;
   camInit = false;
@@ -3172,6 +3204,13 @@ function gapAhead(c) {
     if (along <= 0 || along > 40 || Math.abs(rz * fx - rx * fz) > 2) continue;
     if (along - 4.8 < best) { best = along - 4.8; c.blocker = o; }
   }
+  // pedestrians out on the road (crossing, jaywalking, or knocked down)
+  for (const q of city.peds) {
+    if (cityGround(q.P[0], q.P[2]) !== 0) continue;
+    const rx = q.P[0] - c.P[0], rz = q.P[2] - c.P[1], along = rx * fx + rz * fz;
+    if (along <= 0 || along > 30 || Math.abs(rz * fx - rx * fz) > 1.8) continue;
+    if (along - 2.7 < best) { best = along - 2.7; c.blocker = q; }
+  }
   return best;
 }
 // nobody (car, wreck or player) in the lane at offset `off` from 8 m behind to 12 m ahead of c
@@ -3348,6 +3387,215 @@ function syncTraffic() {
   for (const m of city.carMeshes) m.instanceMatrix.needsUpdate = true;
 }
 
+// ---------- city pedestrians: walk round the block sidewalks, cross at crosswalks on the walk phase ----------
+// A pedestrian walks from block corner `from` to `to` (corners 0..3 = x0z0, x1z0, x1z1, x0z1, inset 2 m
+// into the sidewalk, which lines up with the crosswalk stripes). At a corner they may wait and cross.
+const PED_N = 70;
+const PED_SHIRT = [[0.85, 0.2, 0.18], [0.2, 0.4, 0.75], [0.95, 0.85, 0.3], [0.25, 0.6, 0.35], [0.9, 0.9, 0.88], [0.15, 0.15, 0.17], [0.6, 0.3, 0.6], [0.95, 0.55, 0.2]];
+const PED_PANTS = [[0.15, 0.18, 0.3], [0.25, 0.25, 0.27], [0.45, 0.35, 0.25], [0.1, 0.1, 0.1], [0.55, 0.55, 0.5]];
+const PED_SKIN = [[0.95, 0.78, 0.65], [0.82, 0.62, 0.48], [0.6, 0.42, 0.3], [0.4, 0.27, 0.2]];
+// for each corner, its two crossings: [block di, dj, arrival corner, crosses a road along x]
+const PED_CROSS = [
+  [[0, -1, 3, true], [-1, 0, 1, false]],
+  [[0, -1, 2, true], [1, 0, 0, false]],
+  [[0, 1, 1, true], [1, 0, 3, false]],
+  [[0, 1, 0, true], [-1, 0, 2, false]],
+];
+const PED_NODE = [[0, 0], [1, 0], [1, 1], [0, 1]]; // corner → its junction, relative to the block's (bi, bj)
+const inBlocks = (i, j) => i >= 0 && j >= 0 && i < CITY.BLOCKS && j < CITY.BLOCKS;
+
+function pedCorner(bi, bj, k) {
+  const b = city.blocks[bi * CITY.BLOCKS + bj];
+  return [k === 0 || k === 3 ? b.x0 + 2 : b.x1 - 2, k < 2 ? b.z0 + 2 : b.z1 - 2];
+}
+// where the route puts the pedestrian, and the direction it runs
+function pedRoute(q) {
+  let a, b, t;
+  if (q.mode === 'cross') { a = q.ca; b = q.cb; t = q.u / q.len; }
+  else {
+    a = pedCorner(q.bi, q.bj, q.from); b = pedCorner(q.bi, q.bj, q.to);
+    t = q.mode === 'walk' ? q.u / Math.hypot(b[0] - a[0], b[1] - a[1]) : 1;
+  }
+  const dx = b[0] - a[0], dz = b[1] - a[1], l = Math.hypot(dx, dz) || 1;
+  return [lerp(a[0], b[0], t) - (dz / l) * q.lat, lerp(a[1], b[1], t) + (dx / l) * q.lat, dx / l, dz / l];
+}
+
+function placePed(q, x0, z0, minD, maxD) {
+  const B = CITY.BLOCKS;
+  q.mode = 'walk';
+  for (let tries = 0; tries < 40; tries++) {
+    q.bi = Math.floor(Math.random() * B); q.bj = Math.floor(Math.random() * B);
+    q.from = Math.floor(Math.random() * 4); q.dir = Math.random() < 0.5 ? 1 : -1; q.to = (q.from + q.dir + 4) % 4;
+    const a = pedCorner(q.bi, q.bj, q.from), b = pedCorner(q.bi, q.bj, q.to);
+    q.u = Math.random() * Math.hypot(b[0] - a[0], b[1] - a[1]);
+    const [x, z] = pedRoute(q), d = Math.hypot(x - x0, z - z0);
+    if (d >= minD && d <= maxD) break;
+  }
+  const [x, z, hx, hz] = pedRoute(q);
+  Object.assign(q, { P: [x, CITY.CURB, z], hd: Math.atan2(hz, hx), push: [0, 0], pushV: [0, 0], waitT: 0, dodgeT: 0, ang: 0, V: [0, 0, 0] });
+}
+
+function spawnPeds() {
+  const m = city.pedMeshes, col = new THREE.Color(), pick = (a) => a[Math.floor(Math.random() * a.length)];
+  city.peds = [];
+  for (let k = 0; k < PED_N; k++) {
+    const q = { k, speed: 1.1 + Math.random() * 0.6, lat: (Math.random() - 0.5) * 1.6, jay: Math.random() < 0.08, phase: Math.random() * 6, recycleT: Math.random() * 2 };
+    placePed(q, player.P[0], player.P[2], 12, 200);
+    city.peds.push(q);
+    m.torso.setColorAt(k, col.setRGB(...pick(PED_SHIRT)));
+    m.head.setColorAt(k, col.setRGB(...pick(PED_SKIN)));
+    col.setRGB(...pick(PED_PANTS));
+    m.legs.setColorAt(k * 2, col); m.legs.setColorAt(k * 2 + 1, col);
+  }
+  for (const mesh of [m.torso, m.head, m.legs]) { mesh.count = mesh === m.legs ? PED_N * 2 : PED_N; mesh.instanceColor.needsUpdate = true; }
+}
+
+function stepPeds(dt) {
+  for (const q of city.peds) {
+    const g = cityGround(q.P[0], q.P[2]);
+    if (q.mode === 'tumble') {
+      q.V[1] -= G * dt;
+      for (const b of solidsNear(q.P[0], q.P[2], _solids)) {
+        if (b.h > 2 && q.P[0] > b.x0 - 0.3 && q.P[0] < b.x1 + 0.3 && q.P[2] > b.z0 - 0.3 && q.P[2] < b.z1 + 0.3) { q.V[0] *= -0.2; q.V[2] *= -0.2; break; }
+      }
+      q.P[0] += q.V[0] * dt; q.P[1] += q.V[1] * dt; q.P[2] += q.V[2] * dt;
+      q.ang += q.angV * dt;
+      if (q.P[1] <= g - 0.75 && q.V[1] < 0) {
+        q.P[1] = g - 0.75; q.mode = 'down'; q.downT = 0;
+        q.angT = Math.round((q.ang - Math.PI / 2) / Math.PI) * Math.PI + Math.PI / 2; // flat on back or front
+      }
+      continue;
+    }
+    if (q.mode === 'down') {
+      const k = Math.exp(-5 * dt);
+      q.V[0] *= k; q.V[2] *= k;
+      q.P[0] += q.V[0] * dt; q.P[2] += q.V[2] * dt;
+      q.ang = approach(q.ang, q.angT, dt * 7);
+      q.downT += dt;
+      if (q.downT > 2.8) { q.mode = 'getup'; q.angT = Math.round(q.ang / (Math.PI * 2)) * Math.PI * 2; }
+      continue;
+    }
+    if (q.mode === 'getup') {
+      q.ang = approach(q.ang, q.angT, dt * 2.5);
+      q.P[1] = approach(q.P[1], g, dt * 1.2);
+      if (q.ang === q.angT && q.P[1] === g) {
+        q.ang = 0;
+        q.mode = q.resume;
+        const [x, z] = pedRoute(q);
+        q.push = [q.P[0] - x, q.P[2] - z]; // dust off and walk back to the route
+      }
+      continue;
+    }
+
+    q.recycleT -= dt;
+    if (q.recycleT <= 0) {
+      q.recycleT = 1.5 + Math.random();
+      if (Math.hypot(q.P[0] - player.P[0], q.P[2] - player.P[2]) > 230) { placePed(q, player.P[0], player.P[2], 70, 190); continue; }
+    }
+    let moving = true;
+    if (q.mode === 'walk') {
+      const a = pedCorner(q.bi, q.bj, q.from), b = pedCorner(q.bi, q.bj, q.to);
+      q.u += q.speed * dt;
+      if (q.u >= Math.hypot(b[0] - a[0], b[1] - a[1])) {
+        // at the corner: cross a street now and then, otherwise carry on round the block
+        const opts = PED_CROSS[q.to].filter(([di, dj]) => inBlocks(q.bi + di, q.bj + dj));
+        if (opts.length && Math.random() < 0.35) { q.cross = opts[Math.floor(Math.random() * opts.length)]; q.mode = 'wait'; q.waitT = 0; }
+        else { q.from = q.to; q.to = (q.to + q.dir + 4) % 4; q.u = 0; }
+      }
+    } else if (q.mode === 'wait') {
+      moving = false;
+      const [di, dj, tk, alongX] = q.cross, node = PED_NODE[q.to];
+      q.waitT += dt;
+      if (q.jay ? q.waitT > 1.5 : walkSignal(q.bi + node[0], q.bj + node[1], alongX, simClock)) {
+        q.ca = pedCorner(q.bi, q.bj, q.to); q.cb = pedCorner(q.bi + di, q.bj + dj, tk);
+        q.len = Math.hypot(q.cb[0] - q.ca[0], q.cb[1] - q.ca[1]); q.u = 0; q.mode = 'cross';
+      } else if (q.waitT > 10) { q.mode = 'walk'; q.from = q.to; q.to = (q.to + q.dir + 4) % 4; q.u = 0; }
+    } else if (q.mode === 'cross') {
+      q.u += q.speed * 1.15 * dt;
+      if (q.u >= q.len) {
+        const [di, dj, tk] = q.cross;
+        q.bi += di; q.bj += dj; q.from = tk; q.dir = Math.random() < 0.5 ? 1 : -1; q.to = (tk + q.dir + 4) % 4; q.u = 0; q.mode = 'walk';
+      }
+    }
+
+    // startle: a fast car bearing down within about a second → most jump out of its path
+    q.dodgeT -= dt;
+    if (player.P[1] < 1.5 && q.dodgeT <= 0) {
+      const vx = player.V[0], vz = player.V[2], sp = Math.hypot(vx, vz);
+      const rx = q.P[0] - player.P[0], rz = q.P[2] - player.P[2];
+      const along = (rx * vx + rz * vz) / (sp || 1), lat = (rz * vx - rx * vz) / (sp || 1);
+      if (sp > 6 && along > 0 && along < sp * 0.9 && Math.abs(lat) < 2.4) {
+        q.dodgeT = 1.5;
+        if (Math.random() < 0.65) { const s = (Math.sign(lat) || 1) * 5 / sp; q.pushV = [-vz * s, vx * s]; }
+      }
+    }
+    q.push[0] += q.pushV[0] * dt; q.push[1] += q.pushV[1] * dt;
+    const kv = Math.exp(-4 * dt);
+    q.pushV[0] *= kv; q.pushV[1] *= kv;
+    const pl = Math.hypot(q.push[0], q.push[1]);
+    if (pl > 0) { const s = approach(pl, 0, q.speed * dt) / pl; q.push[0] *= s; q.push[1] *= s; }
+
+    const [x, z, hx, hz] = pedRoute(q);
+    const nx = x + q.push[0], nz = z + q.push[1], mx = nx - q.P[0], mz = nz - q.P[2];
+    if (Math.hypot(mx, mz) > 0.3 * dt) q.hd = Math.atan2(mz, mx);
+    else if (!moving) q.hd = Math.atan2(hz, hx);
+    q.P[0] = nx; q.P[2] = nz;
+    q.P[1] = approach(q.P[1], cityGround(nx, nz), dt * 2);
+    if (moving || pl > 0.05) q.phase += q.speed * dt * 5.5;
+  }
+}
+
+// Player against pedestrians: a crawl nudges them aside, anything faster knocks them flying (cartoon
+// tumble, they lie there a moment, then get up and walk it off). Hopping clears them.
+function pedCollide(p) {
+  if (p.P[1] > 1.2) return;
+  const sp = Math.hypot(p.V[0], p.V[2]), c = Math.cos(p.psi), s = Math.sin(p.psi);
+  for (const q of city.peds) {
+    if (q.mode === 'tumble' || q.mode === 'down' || q.mode === 'getup') continue;
+    const dx = q.P[0] - p.P[0], dz = q.P[2] - p.P[2];
+    if (dx * dx + dz * dz > 16) continue;
+    for (const off of [1.4, -1.4]) {
+      let nx = q.P[0] - (p.P[0] + c * off), nz = q.P[2] - (p.P[2] + s * off);
+      const d = Math.hypot(nx, nz);
+      if (d >= 1.35) continue;
+      nx /= d || 1; nz /= d || 1;
+      if (sp < 2.5) { q.push[0] += nx * (1.35 - d); q.push[1] += nz * (1.35 - d); break; }
+      const k = Math.min(1, 14 / sp) * 0.75;
+      q.resume = q.mode;
+      q.mode = 'tumble';
+      q.V = [p.V[0] * k + nx * 2, clamp(2.5 + sp * 0.1, 3, 8), p.V[2] * k + nz * 2];
+      q.hd = Math.atan2(-p.V[2], -p.V[0]); // facing the car, so the tumble goes over backwards
+      q.angV = 7 + Math.random() * 5;
+      p.pedHits++;
+      p.V[0] *= 0.96; p.V[2] *= 0.96;
+      if (p.mode !== 'air') { const R = cityPose(p); p.u = dot(p.V, p.F); p.v = dot(p.V, R); }
+      shake = Math.max(shake, 0.25); rumble(0.4, 0.6, 140, true); audio.thud(0.18);
+      toast('Pedestrian hit!', 'warn');
+      break;
+    }
+  }
+}
+
+const _pr = new THREE.Matrix4(), _pl = new THREE.Matrix4(), _pq = new THREE.Quaternion(), _pz = new THREE.Vector3(0, 0, 1);
+function syncPeds() {
+  const m = city.pedMeshes;
+  for (const q of city.peds) {
+    // root: pivot about the body centre (1 m up) for heading and tumble, feet at q.P when upright
+    _pr.makeTranslation(q.P[0], q.P[1] + 1, q.P[2])
+      .multiply(_pl.makeRotationY(-q.hd))
+      .multiply(_pl.makeRotationZ(q.ang))
+      .multiply(_pl.makeTranslation(0, -1, 0));
+    m.torso.setMatrixAt(q.k, _pr);
+    m.head.setMatrixAt(q.k, _pr);
+    const swing = q.mode === 'walk' || q.mode === 'cross' || Math.hypot(q.push[0], q.push[1]) > 0.05 ? Math.sin(q.phase) * 0.55 : 0;
+    for (const side of [-1, 1]) {
+      _pl.compose(_tp.set(0, 0.92, side * 0.11), _pq.setFromAxisAngle(_pz, swing * side), _ts);
+      m.legs.setMatrixAt(q.k * 2 + (side > 0 ? 1 : 0), _pl.premultiply(_pr));
+    }
+  }
+  for (const mesh of [m.torso, m.head, m.legs]) mesh.instanceMatrix.needsUpdate = true;
+}
+
 function stepPlayer(p, inp, dt) {
   if (p.offCourse > 0) {
     p.offCourse -= dt;
@@ -3506,6 +3754,8 @@ function simStep(dt) {
   if (player.city) {
     stepTraffic(dt);
     trafficCollide(player);
+    stepPeds(dt);
+    pedCollide(player);
     const sp = Math.hypot(player.V[0], player.V[2]);
     player.topSpeed = Math.max(player.topSpeed, sp);
     player.dist += sp * dt;
@@ -3618,7 +3868,7 @@ function renderOverlay() {
       <div class="row focus"><div class="modes">
         <div class="mode ${mode === 'race' ? 'sel' : ''}" data-act="mode:race"><b>Race</b><span>${RACE_LAPS} laps against 3 electric hypercars</span></div>
         <div class="mode ${mode === 'trial' ? 'sel' : ''}" data-act="mode:trial"><b>Time Trial</b><span>Open track — chase your best lap and 0–60</span></div>
-        <div class="mode ${mode === 'city' ? 'sel' : ''}" data-act="mode:city"><b>City</b><span>Downtown streets with traffic and signals — lift is a short hop here</span></div>
+        <div class="mode ${mode === 'city' ? 'sel' : ''}" data-act="mode:city"><b>City</b><span>Downtown traffic, signals and pedestrians — lift is a short hop here</span></div>
       </div></div>
       <button class="start" data-act="start">START · ${X('A', 'a')} / Enter</button>
       <div class="help">
@@ -3700,7 +3950,7 @@ function placeModel(model, P, F, Up) {
 
 function syncScene() {
   const t = performance.now() / 1000;
-  if (cityActive) { syncTraffic(); updateSignalLamps(simClock); }
+  if (cityActive) { syncTraffic(); syncPeds(); updateSignalLamps(simClock); }
   for (const r of rivals) {
     placeModel(r.model, r.P, r.F, r.Up);
     setBrakeLights(r.model, r.braking);
