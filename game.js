@@ -1510,7 +1510,7 @@ function cityGround(x, z) {
 
 const city = {
   built: false, group: null, blocks: [], cells: new Map(), walls: [],
-  signals: [], signalLamps: null, signalHalos: null, carMeshes: [], traffic: [], pedMeshes: null, peds: [],
+  signals: [], signalLamps: null, signalHalos: null, carMeshes: [], policeLamps: null, traffic: [], pedMeshes: null, peds: [],
 };
 const cityCell = (c) => Math.floor((c - CITY.MIN) / CITY.PITCH);
 const cellKey = (i, j) => (i + 2) * 100 + (j + 2);
@@ -1848,17 +1848,23 @@ function buildCity() {
   });
   for (const m of [bulbs, halos]) { m.frustumCulled = false; grp.add(m); }
 
-  // traffic: one instanced mesh per body style, recoloured per car
+  // traffic: one instanced mesh per body style (the last is the police interceptor), recoloured per car
   const carMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.42, metalness: 0.25 });
-  city.carMeshes = TRAFFIC_STYLES.map((style) => {
-    const m = new THREE.InstancedMesh(trafficGeo(style), carMat, TRAFFIC_N);
+  city.carMeshes = [...TRAFFIC_STYLES, 'police'].map((style) => {
+    const n = style === 'police' ? POLICE_N : TRAFFIC_N;
+    const m = new THREE.InstancedMesh(trafficGeo(style), carMat, n);
     m.count = 0;
-    for (let k = 0; k < TRAFFIC_N; k++) m.setColorAt(k, new THREE.Color(1, 1, 1));
+    for (let k = 0; k < n; k++) m.setColorAt(k, new THREE.Color(1, 1, 1));
     m.castShadow = true; m.receiveShadow = true;
     m.frustumCulled = false;
     grp.add(m);
     return m;
   });
+  // police light bars: a red and a blue lamp per car, flashed in syncTraffic
+  const lamps2 = city.policeLamps = new THREE.InstancedMesh(new THREE.BoxGeometry(0.26, 0.13, 0.5), new THREE.MeshBasicMaterial({ color: 0xffffff }), POLICE_N * 2);
+  for (let k = 0; k < POLICE_N * 2; k++) lamps2.setColorAt(k, new THREE.Color(0, 0, 0));
+  lamps2.frustumCulled = false;
+  grp.add(lamps2);
 
   // pedestrians: shirt (torso + arms), head, and legs (two instances each so they can swing)
   const pedMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.8 });
@@ -1933,16 +1939,26 @@ function updateSignalLamps(t) {
 // Traffic car bodies: local +X forward, +Z right, wheels on y = 0. Paint is white so instance colours tint it.
 const TRAFFIC_N = 44;
 const TRAFFIC_STYLES = ['sedan', 'suv', 'van'];
+const POLICE_N = 6, POLICE_STYLE = TRAFFIC_STYLES.length;
+const POLICE_BAR = [[-0.25, 1.71, -0.38], [-0.25, 1.71, 0.38]]; // red, blue lamp centres in the car's frame
 const TRAFFIC_PAINT = [[0.92, 0.92, 0.9], [0.62, 0.64, 0.67], [0.1, 0.1, 0.11], [0.6, 0.06, 0.06], [0.08, 0.2, 0.5], [0.12, 0.3, 0.18], [0.95, 0.72, 0.08], [0.72, 0.64, 0.5]];
 function trafficGeo(style) {
-  const PAINT = [1, 1, 1], GLASS = [0.05, 0.06, 0.07], TYRE = [0.04, 0.04, 0.04], HEAD = [1, 1, 0.95], TAIL = [0.9, 0.06, 0.05];
-  const [L, H, W] = style === 'van' ? [5.4, 1.7, 2.0] : style === 'suv' ? [4.8, 0.95, 1.95] : [4.5, 0.72, 1.84];
-  const y0 = 0.22, parts = [[new THREE.BoxGeometry(L, H, W), M4(0, y0 + H / 2, 0), PAINT]];
+  const PAINT = [1, 1, 1], BLACK = [0.06, 0.06, 0.07], GLASS = [0.05, 0.06, 0.07], TYRE = [0.04, 0.04, 0.04], HEAD = [1, 1, 0.95], TAIL = [0.9, 0.06, 0.05];
+  const police = style === 'police';
+  const [L, H, W] = style === 'van' ? [5.4, 1.7, 2.0] : style === 'suv' ? [4.8, 0.95, 1.95] : police ? [4.7, 0.74, 1.88] : [4.5, 0.72, 1.84];
+  const y0 = 0.22;
+  const parts = police // black-and-white: dark lower body, white upper
+    ? [[new THREE.BoxGeometry(L, H * 0.5, W), M4(0, y0 + H * 0.25, 0), BLACK], [new THREE.BoxGeometry(L * 0.99, H * 0.5, W * 1.005), M4(0, y0 + H * 0.75, 0), PAINT]]
+    : [[new THREE.BoxGeometry(L, H, W), M4(0, y0 + H / 2, 0), PAINT]];
   if (style === 'van') parts.push([new THREE.BoxGeometry(0.9, H * 0.42, W * 1.01), M4(L / 2 - 0.5, y0 + H * 0.72, 0), GLASS]);
   else {
     const [cl, ch, cx] = style === 'suv' ? [2.9, 0.72, -0.35] : [2.3, 0.58, -0.25];
     parts.push([new THREE.BoxGeometry(cl, ch, W * 0.88), M4(cx, y0 + H + ch / 2, 0), GLASS]);
     parts.push([new THREE.BoxGeometry(cl * 0.86, 0.07, W * 0.9), M4(cx, y0 + H + ch, 0), PAINT]);
+  }
+  if (police) {
+    parts.push([new THREE.BoxGeometry(0.34, 0.1, 1.34), M4(-0.25, y0 + H + 0.63, 0), [0.12, 0.12, 0.13]]);
+    parts.push([new THREE.BoxGeometry(0.12, 0.42, 1.4), M4(L / 2 + 0.08, y0 + 0.32, 0), BLACK]); // push bar
   }
   for (const sx of [-1, 1]) for (const sz of [-1, 1]) {
     parts.push([new THREE.CylinderGeometry(0.34, 0.34, 0.26, 12), new THREE.Matrix4().makeRotationX(Math.PI / 2).setPosition(sx * L * 0.32, 0.34, sz * (W / 2 - 0.08)), TYRE]);
@@ -2283,6 +2299,11 @@ const audio = {
     this.fan = mk('bandpass', 280, 1.2);
     this.skid = mk('bandpass', 520, 1.5);
     this.scrape = mk('lowpass', 900, 0.7);
+    // police siren: two detuned squares through a band-pass; the wail is swept in update()
+    const sf = c.createBiquadFilter(); sf.type = 'bandpass'; sf.frequency.value = 1100; sf.Q.value = 0.8;
+    this.sirenG = c.createGain(); this.sirenG.gain.value = 0;
+    sf.connect(this.sirenG); this.sirenG.connect(this.master);
+    this.sirenO = [-8, 8].map((det) => { const o = c.createOscillator(); o.type = 'square'; o.frequency.value = 800; o.detune.value = det; o.connect(sf); o.start(); return o; });
     this.buildMusic();
   },
   update(p) {
@@ -2307,6 +2328,9 @@ const audio = {
     set(this.fan.g, m * (p && (p.suction || p.diving) ? 0.12 : 0.02));
     set(this.skid.g, m * (p && !air && p.slip > 4 ? Math.min(0.12, (p.slip - 4) * 0.015) : 0), 0.08);
     set(this.scrape.g, m * (p && p.scraping > 0 ? 0.1 : 0));
+    const siren = live && cityActive ? law.siren : 0;
+    set(this.sirenG.gain, siren * 0.05, 0.1);
+    if (siren > 0) for (const o of this.sirenO) o.frequency.setTargetAtTime(820 + 380 * Math.sin(t * Math.PI * 0.9), t, 0.02);
     this.music(t);
   },
   // ---- music: 118 BPM synthwave in A minor, 8-bar loop of 16th steps
@@ -2641,7 +2665,7 @@ function startRace() {
   setWorld(mode === 'city');
   player = mode === 'city' ? makeCityPlayer(ROADSTER) : makePlayer(ROADSTER);
   rivals = mode === 'race' ? makeRivals() : [];
-  if (mode === 'city') { spawnTraffic(); spawnPeds(); }
+  if (mode === 'city') { Object.assign(law, freshLaw()); spawnTraffic(); spawnPeds(); }
   raceTime = 0; simClock = 0; countdown = 4; lastLights = -1; goFlash = 0; finishTimer = 0;
   toasts.length = 0;
   camInit = false;
@@ -3262,6 +3286,13 @@ function spawnTraffic() {
     city.traffic.push(c);
     city.carMeshes[c.style].setColorAt(c.idx, paint.setRGB(...TRAFFIC_PAINT[Math.floor(Math.random() * TRAFFIC_PAINT.length)]));
   }
+  // police: a couple on patrol in traffic, the rest parked until they're dispatched
+  for (let k = 0; k < POLICE_N; k++) {
+    const c = { k: TRAFFIC_N + k, police: true, style: POLICE_STYLE, idx: k, cruise: 11 + Math.random() * 2, recycleT: Math.random(), P: [0, 0] };
+    if (k < POLICE_PATROL) placeTraffic(c, player.P[0], player.P[2], 80, 380);
+    else parkPolice(c);
+    city.traffic.push(c);
+  }
   city.carMeshes.forEach((m, s) => { m.count = city.traffic.filter((c) => c.style === s).length; m.instanceColor.needsUpdate = true; });
 }
 
@@ -3286,13 +3317,24 @@ function stepKnocked(c, dt) {
 function stepTraffic(dt) {
   const h = CITY.ROAD_W / 2;
   for (const c of city.traffic) {
+    if (c.state === 'off') continue;
     c.recycleT -= dt;
-    if (c.recycleT <= 0) {
+    if (c.recycleT <= 0 && c.state !== 'pursuit') {
       c.recycleT = 1 + Math.random();
       const far = Math.hypot(c.P[0] - player.P[0], c.P[1] - player.P[2]);
       if (far > 340 || (c.state === 'knocked' && c.knockT > 8 && far > 40)) { placeTraffic(c, player.P[0], player.P[2], 120, 300); continue; }
     }
-    if (c.state === 'knocked') { stepKnocked(c, dt); continue; }
+    if (c.state === 'knocked') {
+      stepKnocked(c, dt);
+      if (c.police && law.stars > 0 && c.knockT > 2) startPursuit(c); // shakes it off and carries on
+      continue;
+    }
+    if (c.state === 'pursuit') {
+      // a unit left far behind is radioed back in closer to you
+      if (c.recycleT <= 0) { c.recycleT = 2; if (Math.hypot(c.P[0] - player.P[0], c.P[1] - player.P[2]) > 420) deployPolice(c); }
+      stepPursuit(c, dt);
+      continue;
+    }
 
     let vT = c.state === 'turn' ? 7 : c.cruise;
     if (c.state === 'lane' && c.next !== 'S') vT = Math.min(vT, 7 + Math.max(0, (c.next === 'R' ? -LANE_OUT - RIGHT_R : -h) - c.a) * 0.35);
@@ -3338,15 +3380,15 @@ function stepTraffic(dt) {
   }
 }
 
-// Player against traffic: circle pairs along each car. Slow nudges bounce off; real hits knock the car loose.
-// Hopping clears them.
+// Player against traffic: circle pairs along each car. Slow nudges bounce off; real hits knock the car loose
+// (police are heavier and take a big hit to stun). Hopping clears them.
 function trafficCollide(p) {
   if (p.P[1] > 1.7) return 0;
   let worst = 0;
   const pc = Math.cos(p.psi), ps = Math.sin(p.psi);
   for (const c of city.traffic) {
     const dx0 = p.P[0] - c.P[0], dz0 = p.P[2] - c.P[1];
-    if (dx0 * dx0 + dz0 * dz0 > 49) continue;
+    if (c.state === 'off' || dx0 * dx0 + dz0 * dz0 > 49) continue;
     const cc = Math.cos(c.psi), cs = Math.sin(c.psi);
     for (const po of [1.4, -1.4]) for (const co of [1.3, -1.3]) {
       const ax = p.P[0] + pc * po, az = p.P[2] + ps * po, bx = c.P[0] + cc * co, bz = c.P[1] + cs * co;
@@ -3360,8 +3402,21 @@ function trafficCollide(p) {
       const cvx = knocked ? c.V[0] : cc * c.v, cvz = knocked ? c.V[1] : cs * c.v;
       const vrel = (p.V[0] - cvx) * nx + (p.V[2] - cvz) * nz;
       if (vrel >= 0) continue;
-      if (!knocked && vrel > -2) { p.V[0] -= nx * vrel * 1.2; p.V[2] -= nz * vrel * 1.2; continue; }
-      if (!knocked) { c.state = 'knocked'; c.V = [cvx, cvz]; c.w = 0; c.knockT = 0; c.braking = true; c.laneYaw = 0; }
+      const cop = c.police && !knocked;
+      if (!knocked && vrel > (cop ? -14 : -2)) {
+        p.V[0] -= nx * vrel * 1.2; p.V[2] -= nz * vrel * 1.2;
+        if (cop) {
+          c.v *= 0.85;
+          worst = Math.max(worst, -vrel);
+          if (p.V[0] * nx + p.V[2] * nz < -4 && c.state !== 'pursuit') report('police'); // you drove into a patrol car
+        }
+        continue;
+      }
+      if (!knocked) {
+        c.state = 'knocked'; c.V = [cvx, cvz]; c.w = 0; c.knockT = 0; c.braking = true; c.laneYaw = 0;
+        if (!c.police) { if (p.V[0] * nx + p.V[2] * nz < -2) report('crash'); } // you hit them, not the other way round
+        else if (p.V[0] * nx + p.V[2] * nz < -4) report('police'); // only if you were the one ramming
+      }
       const j = (-1.2 * vrel) / (1 + 1 / 1.3);
       p.V[0] += nx * j; p.V[2] += nz * j;
       c.V[0] -= (nx * j) / 1.3; c.V[1] -= (nz * j) / 1.3;
@@ -3379,12 +3434,31 @@ function trafficCollide(p) {
 }
 
 const _tm = new THREE.Matrix4(), _tq = new THREE.Quaternion(), _tp = new THREE.Vector3(), _ts = new THREE.Vector3(1, 1, 1), _ty = new THREE.Vector3(0, 1, 0);
+const _tc = new THREE.Color(), _hide = new THREE.Matrix4().makeScale(0, 0, 0);
 function syncTraffic() {
+  const lamps = city.policeLamps, flash = Math.floor(performance.now() / 110) % 2;
   for (const c of city.traffic) {
+    if (c.state === 'off') {
+      city.carMeshes[c.style].setMatrixAt(c.idx, _hide);
+      if (c.police) { lamps.setMatrixAt(c.idx * 2, _hide); lamps.setMatrixAt(c.idx * 2 + 1, _hide); }
+      continue;
+    }
     _tm.compose(_tp.set(c.P[0], 0, c.P[1]), _tq.setFromAxisAngle(_ty, -c.psi), _ts);
     city.carMeshes[c.style].setMatrixAt(c.idx, _tm);
+    if (!c.police) continue;
+    // light bar: alternating red / blue while chasing, with a puff of additive glow
+    const on = c.state === 'pursuit' || (c.state === 'knocked' && law.stars > 0);
+    POLICE_BAR.forEach(([lx, ly, lz], li) => {
+      const lit = on && li === flash;
+      _tp.set(lx, ly, lz).applyMatrix4(_tm);
+      lamps.setMatrixAt(c.idx * 2 + li, _pl.makeTranslation(lx, ly, lz).premultiply(_tm));
+      lamps.setColorAt(c.idx * 2 + li, lit ? _tc.setRGB(...(li ? [0.25, 0.55, 5] : [5, 0.25, 0.18])) : _tc.setRGB(...(li ? [0.05, 0.08, 0.35] : [0.35, 0.05, 0.05])));
+      if (lit && Math.random() < 0.7) emit([_tp.x, _tp.y, _tp.z], [Math.cos(c.psi) * c.v, 0.3, Math.sin(c.psi) * c.v], 0.1, li ? [0.35, 0.55, 1.6] : [1.6, 0.35, 0.3]);
+    });
   }
   for (const m of city.carMeshes) m.instanceMatrix.needsUpdate = true;
+  lamps.instanceMatrix.needsUpdate = true;
+  lamps.instanceColor.needsUpdate = true;
 }
 
 // ---------- city pedestrians: walk round the block sidewalks, cross at crosswalks on the walk phase ----------
@@ -3570,7 +3644,7 @@ function pedCollide(p) {
       p.V[0] *= 0.96; p.V[2] *= 0.96;
       if (p.mode !== 'air') { const R = cityPose(p); p.u = dot(p.V, p.F); p.v = dot(p.V, R); }
       shake = Math.max(shake, 0.25); rumble(0.4, 0.6, 140, true); audio.thud(0.18);
-      toast('Pedestrian hit!', 'warn');
+      report('ped');
       break;
     }
   }
@@ -3595,6 +3669,250 @@ function syncPeds() {
   }
   for (const mesh of [m.torso, m.head, m.legs]) mesh.instanceMatrix.needsUpdate = true;
 }
+
+// ---------- city law: offences seen by police raise the wanted level; police chase and try to box you in ----------
+const SPEED_LIMIT = 35 / MPH; // posted everywhere downtown
+// needsCop: only counts if a police car can see you; hits are always called in by witnesses.
+// heat accumulates: the first offence makes you wanted (1★), each star after that takes more.
+const OFFENCES = {
+  speeding: { name: 'Speeding', heat: 0.4, needsCop: true, fine: 150 },
+  reckless: { name: 'Reckless speed', heat: 0.8, needsCop: true, fine: 600 },
+  red: { name: 'Ran a red light', heat: 0.6, needsCop: true, fine: 250 },
+  sidewalk: { name: 'Driving on the sidewalk', heat: 0.5, needsCop: true, fine: 300 },
+  wrongway: { name: 'Wrong way', heat: 0.5, needsCop: true, fine: 200 },
+  flight: { name: 'Illegal flight', heat: 1.5, needsCop: true, fine: 1000 },
+  crash: { name: 'Hit a car', heat: 0.7, needsCop: false, fine: 400 },
+  ped: { name: 'Hit a pedestrian', heat: 1.5, needsCop: false, fine: 2000 },
+  police: { name: 'Rammed a police car', heat: 1, needsCop: false, fine: 800 },
+};
+const PURSUERS = [0, 1, 2, 3, 4, 6]; // units hunting you at each star level
+const POLICE_PATROL = 2;
+const POLICE_VMAX = 40; // ≈ 90 mph: the Roadster can outrun them on a straight, not round corners
+const freshLaw = () => ({ heat: 0, stars: 0, maxStars: 0, seen: false, hunterSees: false, unseenT: 0, bustT: 0, tickT: 0, cool: {}, counts: {}, fines: 0, runT: 0, sidewalkT: 0, wrongT: 0, wasJunction: false, lastBand: null, flew: false, siren: 0 });
+const law = freshLaw();
+
+function report(kind) {
+  const o = OFFENCES[kind];
+  if (!player || player.finished || (o.needsCop && !law.seen) || law.cool[kind] > 0) return;
+  law.cool[kind] = 8;
+  law.counts[kind] = (law.counts[kind] || 0) + 1;
+  law.fines += o.fine;
+  const before = law.stars;
+  law.heat = Math.min(5.99, Math.max(law.heat + o.heat, 1));
+  law.stars = Math.floor(law.heat);
+  law.maxStars = Math.max(law.maxStars, law.stars);
+  law.unseenT = 0;
+  toast(`${o.name}${law.stars > before ? '  ' + '★'.repeat(law.stars) : ''}`, 'warn');
+  dispatchPolice();
+}
+
+// a clear view at car height: no building in the way (sampled every 5 m)
+const _losSolids = [];
+function cityLineClear(x0, z0, x1, z1) {
+  const n = Math.ceil(Math.hypot(x1 - x0, z1 - z0) / 5);
+  for (let s = 1; s < n; s++) {
+    const x = lerp(x0, x1, s / n), z = lerp(z0, z1, s / n);
+    for (const b of solidsNear(x, z, _losSolids)) if (b.h > 3 && x > b.x0 && x < b.x1 && z > b.z0 && z < b.z1) return false;
+  }
+  return true;
+}
+
+function parkPolice(c) {
+  Object.assign(c, { state: 'off', P: [1e5, 1e5], psi: 0, v: 0, V: [0, 0], w: 0, knockT: 0, braking: false, sees: false });
+}
+function startPursuit(c) {
+  Object.assign(c, { state: 'pursuit', laneYaw: 0, reverseT: 0, stuckT: 0, direct: false, braking: false, vT: 10 });
+  if (Math.abs(c.v) < 0.1 && c.V) c.v = Math.hypot(c.V[0], c.V[1]);
+  chaseSegment(c);
+}
+// bring a parked unit in at a junction 150–240 m away, out of sight if possible
+function deployPolice(c) {
+  const p = player;
+  let ni = 0, nj = 0;
+  for (let tries = 0; tries < 40; tries++) {
+    ni = Math.floor(Math.random() * (CITY.BLOCKS + 1)); nj = Math.floor(Math.random() * (CITY.BLOCKS + 1));
+    const x = roadLine(ni), z = roadLine(nj), d = Math.hypot(x - p.P[0], z - p.P[2]);
+    if (d > 150 && d < 240 && (tries > 30 || !cityLineClear(x, z, p.P[0], p.P[2]))) break;
+  }
+  Object.assign(c, { ni, nj, P: [roadLine(ni), roadLine(nj)], psi: Math.atan2(p.P[2] - roadLine(nj), p.P[0] - roadLine(ni)), v: 12, V: [0, 0], w: 0 });
+  startPursuit(c);
+}
+function dispatchPolice() {
+  if (!law.stars) return;
+  const want = PURSUERS[law.stars];
+  const cops = city.traffic.filter((c) => c.police);
+  let hunting = cops.filter((c) => c.state === 'pursuit' || c.state === 'knocked').length;
+  const patrol = (c) => c.state === 'lane' || c.state === 'turn';
+  for (const c of cops) if (hunting < want && patrol(c) && c.sees) { startPursuit(c); hunting++; }
+  for (const c of cops) if (hunting < want && c.state === 'off') { deployPolice(c); hunting++; }
+  for (const c of cops) if (hunting < want && patrol(c)) { startPursuit(c); hunting++; } // radioed in
+}
+function endPursuit() {
+  let patrols = 0;
+  for (const c of city.traffic) {
+    if (!c.police || c.state === 'lane' || c.state === 'turn') { if (c.police && c.state !== 'off') patrols++; continue; }
+    if (patrols < POLICE_PATROL) { placeTraffic(c, player.P[0], player.P[2], 150, 300); patrols++; }
+    else parkPolice(c);
+  }
+}
+
+// Pursuit driving: head straight for you (with a little lead) when they can see you up close,
+// otherwise follow the streets segment by segment (prev → next junction), keeping right, toward you.
+function nextChaseNode(c) {
+  let bd = Infinity;
+  const ci = c.ni, cj = c.nj;
+  c.pi = ci; c.pj = cj;
+  for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+    const i = ci + dx, j = cj + dz;
+    if (!inGrid(i, j)) continue;
+    const d = Math.hypot(roadLine(i) - player.P[0], roadLine(j) - player.P[2]);
+    if (d < bd) { bd = d; c.ni = i; c.nj = j; }
+  }
+}
+// put the unit on the nearest street segment, heading for whichever end is nearer to you
+function chaseSegment(c) {
+  const B = CITY.BLOCKS, fi = (c.P[0] - CITY.MIN) / CITY.PITCH, fj = (c.P[1] - CITY.MIN) / CITY.PITCH;
+  const ri = clamp(Math.round(fi), 0, B), rj = clamp(Math.round(fj), 0, B);
+  let a, b;
+  if (Math.abs(c.P[1] - roadLine(rj)) < Math.abs(c.P[0] - roadLine(ri))) { const i0 = clamp(Math.floor(fi), 0, B - 1); a = [i0, rj]; b = [i0 + 1, rj]; }
+  else { const j0 = clamp(Math.floor(fj), 0, B - 1); a = [ri, j0]; b = [ri, j0 + 1]; }
+  const da = Math.hypot(roadLine(a[0]) - player.P[0], roadLine(a[1]) - player.P[2]);
+  const db = Math.hypot(roadLine(b[0]) - player.P[0], roadLine(b[1]) - player.P[2]);
+  const [prev, next] = da < db ? [b, a] : [a, b];
+  [c.pi, c.pj] = prev; [c.ni, c.nj] = next;
+}
+function stepPursuit(c, dt) {
+  const p = player;
+  const dist = Math.hypot(p.P[0] - c.P[0], p.P[2] - c.P[1]);
+  let tx, tz;
+  if (c.sees && dist < 60) {
+    const lead = Math.min(0.8, dist / 40);
+    tx = p.P[0] + p.V[0] * lead; tz = p.P[2] + p.V[2] * lead;
+    c.direct = true;
+  } else {
+    if (c.direct) { c.direct = false; chaseSegment(c); }
+    let ax = roadLine(c.pi), az = roadLine(c.pj), sx = roadLine(c.ni) - ax, sz = roadLine(c.nj) - az, L = Math.hypot(sx, sz);
+    let t = (c.P[0] - ax) * (sx / L) + (c.P[1] - az) * (sz / L);
+    if (t > L - 3) { // at the junction: pick the next street
+      nextChaseNode(c);
+      ax = roadLine(c.pi); az = roadLine(c.pj); sx = roadLine(c.ni) - ax; sz = roadLine(c.nj) - az; L = Math.hypot(sx, sz);
+      t = (c.P[0] - ax) * (sx / L) + (c.P[1] - az) * (sz / L);
+    }
+    // pure pursuit on the street's right-hand lane, 14 m ahead of where we are along it
+    const ux = sx / L, uz = sz / L, look = Math.min(L, Math.max(0, t) + 14);
+    tx = ax + ux * look - uz * LANE_IN; tz = az + uz * look + ux * LANE_IN;
+  }
+  const err = wrapAngle(Math.atan2(tz - c.P[1], tx - c.P[0]) - c.psi);
+  if (c.reverseT > 0) {
+    // backing out of a wall: reverse while swinging the nose toward the target
+    c.reverseT -= dt;
+    c.v = approach(c.v, -6, 15 * dt);
+    c.psi = wrapAngle(c.psi - clamp(err, -1, 1) * 1.2 * dt);
+  } else {
+    const yawMax = 9 / Math.max(Math.abs(c.v), 5);
+    c.psi = wrapAngle(c.psi + clamp(err * 2.5, -yawMax, yawMax) * dt);
+    const a = Math.abs(err), mine = Math.hypot(p.V[0], p.V[2]);
+    // close in, then match your speed; pull up beside you when you stop. From 3★ they ram you while you run.
+    const close = law.stars >= 3 && mine > 6 ? Math.max(mine + 4, 10) : dist < 8 ? Math.max(0, mine - 1) : Math.max(mine + 4, 6);
+    const vT = a > 1.2 ? 8 : a > 0.5 ? 18 : c.direct && dist < 15 ? close : POLICE_VMAX;
+    c.v = c.v < vT ? Math.min(vT, c.v + 11 * dt) : Math.max(vT, c.v - 16 * dt);
+    c.vT = vT;
+  }
+  c.braking = c.v < 0;
+  c.P[0] += Math.cos(c.psi) * c.v * dt; c.P[1] += Math.sin(c.psi) * c.v * dt;
+  let walled = false;
+  for (const b of solidsNear(c.P[0], c.P[1], _solids)) {
+    if (b.h < 1) continue;
+    const qx = clamp(c.P[0], b.x0, b.x1), qz = clamp(c.P[1], b.z0, b.z1), dx = c.P[0] - qx, dz = c.P[1] - qz, d = Math.hypot(dx, dz);
+    if (d >= 1.7 || d < 1e-6) continue;
+    c.P[0] += (dx / d) * (1.7 - d); c.P[1] += (dz / d) * (1.7 - d);
+    walled = true;
+  }
+  if (walled) c.v *= 0.9;
+  if (Math.abs(c.v) < 1.5 && c.reverseT <= 0 && c.vT > 4) { c.stuckT += dt; if (c.stuckT > 1.2) { c.reverseT = 1.1; c.stuckT = 0; } } else c.stuckT = 0;
+  // shove civilians out of the way; keep clear of other units
+  for (const o of city.traffic) {
+    if (o === c || o.state === 'off') continue;
+    const dx = o.P[0] - c.P[0], dz = o.P[1] - c.P[1], d = Math.hypot(dx, dz);
+    if (d > 3.6 || d < 1e-6) continue;
+    const nx = dx / d, nz = dz / d, push = 3.6 - d;
+    if (o.police && o.state === 'pursuit') { o.P[0] += nx * push * 0.5; o.P[1] += nz * push * 0.5; c.P[0] -= nx * push * 0.5; c.P[1] -= nz * push * 0.5; continue; }
+    if (o.state !== 'knocked') { o.state = 'knocked'; o.V = [Math.cos(o.psi) * o.v, Math.sin(o.psi) * o.v]; o.w = 0; o.knockT = 0; o.laneYaw = 0; }
+    o.V[0] += nx * (2 + Math.abs(c.v) * 0.3); o.V[1] += nz * (2 + Math.abs(c.v) * 0.3);
+    o.w += (Math.random() - 0.5) * 2;
+    c.v *= 0.9;
+  }
+  c.V = [Math.cos(c.psi) * c.v, Math.sin(c.psi) * c.v];
+}
+
+// 10 Hz: who can see you, which rules you're breaking, losing the police, getting boxed in
+function lawTick(p, dt) {
+  for (const k in law.cool) law.cool[k] -= dt;
+  law.seen = false; law.hunterSees = false;
+  let near = Infinity;
+  for (const c of city.traffic) {
+    if (!c.police) continue;
+    c.sees = false;
+    if (c.state === 'off' || c.state === 'knocked') continue;
+    const d = Math.hypot(p.P[0] - c.P[0], p.P[2] - c.P[1]), hunting = c.state === 'pursuit';
+    if (d < (hunting ? 140 : 70) && cityLineClear(c.P[0], c.P[1], p.P[0], p.P[2])) {
+      c.sees = law.seen = true;
+      if (hunting) law.hunterSees = true;
+    }
+    if (hunting) near = Math.min(near, d);
+  }
+  law.siren = near < Infinity ? clamp(1 - near / 260, 0, 1) : 0;
+  if (p.finished) return;
+
+  const sp = Math.hypot(p.V[0], p.V[2]);
+  if (p.mode === 'air') {
+    if (!law.flew && law.seen) { law.flew = true; report('flight'); }
+  } else {
+    law.flew = false;
+    if (sp > 90 / MPH) report('reckless');
+    else if (sp > SPEED_LIMIT + 15 / MPH) report('speeding');
+    const driving = input.throttle > 0.1 || p.boosting; // being shoved onto the curb by a cruiser isn't on you
+    law.sidewalkT = cityGround(p.P[0], p.P[2]) > 0 && sp > 2 && driving ? law.sidewalkT + dt : 0;
+    if (law.sidewalkT > 0.4) report('sidewalk');
+    // wrong way: pointing along a road while in its left-hand lanes
+    const bx = cityBand(p.P[0]), bz = cityBand(p.P[2]), c = Math.cos(p.psi), s = Math.sin(p.psi);
+    const lineX = roadLine(Math.round((p.P[0] - CITY.MIN) / CITY.PITCH)), lineZ = roadLine(Math.round((p.P[2] - CITY.MIN) / CITY.PITCH));
+    let wrong = false;
+    if (bz === 0 && bx === 1 && Math.abs(c) > 0.7) wrong = Math.sign(c) * (p.P[2] - lineZ) < -0.8; // heading +x keeps to +z
+    if (bx === 0 && bz === 1 && Math.abs(s) > 0.7) wrong = Math.sign(s) * (p.P[0] - lineX) > 0.8; // heading +z keeps to −x
+    law.wrongT = wrong && sp > 3 && driving ? law.wrongT + dt : 0;
+    if (law.wrongT > 1.5) report('wrongway');
+    // red light: rolling into a junction off a road whose signal is red
+    const inJ = bx === 0 && bz === 0;
+    if (inJ && !law.wasJunction && law.lastBand && sp > 3) {
+      const i = Math.round((p.P[0] - CITY.MIN) / CITY.PITCH), j = Math.round((p.P[2] - CITY.MIN) / CITY.PITCH);
+      if (signalAt(i, j, law.lastBand === 'x', simClock) === 'r') report('red');
+    }
+    law.wasJunction = inJ;
+    if (bz === 0 && bx === 1) law.lastBand = 'x';
+    else if (bx === 0 && bz === 1) law.lastBand = 'z';
+  }
+
+  if (law.stars > 0) {
+    law.runT += dt;
+    dispatchPolice();
+    law.unseenT = law.hunterSees ? 0 : law.unseenT + dt;
+    if (law.unseenT > escapeTime()) {
+      law.stars--; law.heat = law.stars; law.unseenT = 0;
+      toast(law.stars ? `Losing them…  ${'★'.repeat(law.stars)}` : 'You lost the police', 'good');
+      if (!law.stars) endPursuit();
+    }
+    // stopped with a unit right on you: they're making the arrest
+    const boxed = p.mode !== 'air' && sp < 2.5 && near < 9;
+    law.bustT = boxed ? law.bustT + dt : Math.max(0, law.bustT - dt * 0.5);
+    if (law.bustT > 2.5) {
+      p.finished = true; finishTimer = 2.2;
+      toast('BUSTED', 'big');
+      rumble(1, 1, 500, true); audio.thud(0.5);
+    }
+  } else law.bustT = 0;
+}
+const escapeTime = () => 8 + 2 * law.stars; // seconds out of every hunter's sight to drop a star
 
 function stepPlayer(p, inp, dt) {
   if (p.offCourse > 0) {
@@ -3756,6 +4074,8 @@ function simStep(dt) {
     trafficCollide(player);
     stepPeds(dt);
     pedCollide(player);
+    law.tickT += dt;
+    if (law.tickT >= 0.1) { law.tickT -= 0.1; lawTick(player, 0.1); }
     const sp = Math.hypot(player.V[0], player.V[2]);
     player.topSpeed = Math.max(player.topSpeed, sp);
     player.dist += sp * dt;
@@ -3868,7 +4188,7 @@ function renderOverlay() {
       <div class="row focus"><div class="modes">
         <div class="mode ${mode === 'race' ? 'sel' : ''}" data-act="mode:race"><b>Race</b><span>${RACE_LAPS} laps against 3 electric hypercars</span></div>
         <div class="mode ${mode === 'trial' ? 'sel' : ''}" data-act="mode:trial"><b>Time Trial</b><span>Open track — chase your best lap and 0–60</span></div>
-        <div class="mode ${mode === 'city' ? 'sel' : ''}" data-act="mode:city"><b>City</b><span>Downtown traffic, signals and pedestrians — lift is a short hop here</span></div>
+        <div class="mode ${mode === 'city' ? 'sel' : ''}" data-act="mode:city"><b>City</b><span>Traffic, pedestrians and police — 35 mph limit, and lift is a short (illegal) hop</span></div>
       </div></div>
       <button class="start" data-act="start">START · ${X('A', 'a')} / Enter</button>
       <div class="help">
@@ -3904,6 +4224,18 @@ function renderOverlay() {
       <div class="menu-list">${items.map(([a, l], i) => `<div class="menu-item ${i === pauseSel ? 'sel' : ''}" data-act="${a}">${l}</div>`).join('')}</div>
       <div class="hint">${X('A', 'a')} select · ${X('B', 'b')} resume</div>
       ${padStatusHTML()}
+    </div>`;
+  } else if (state === 'results' && player && player.city) {
+    const rows = Object.entries(law.counts).map(([k, n]) => `<tr><td>${OFFENCES[k].name}</td><td>× ${n}</td><td>$${(OFFENCES[k].fine * n).toLocaleString()}</td></tr>`).join('')
+      || '<tr><td colspan="3">Clean record — they just caught up with you</td></tr>';
+    html = `<div class="panel narrow">
+      <h1 class="heading">BUSTED</h1>
+      <div class="heading-sub">On the run ${fmtTime(law.runT)} · Most wanted ${'★'.repeat(law.maxStars) || '—'} · Fines $${law.fines.toLocaleString()}</div>
+      <table class="results"><tr><th>OFFENCE</th><th>COUNT</th><th>FINE</th></tr>${rows}</table>
+      <div class="menu-list">
+        <div class="menu-item ${resultsSel === 0 ? 'sel' : ''}" data-act="restart">Try again</div>
+        <div class="menu-item ${resultsSel === 1 ? 'sel' : ''}" data-act="menu">Main menu</div>
+      </div>
     </div>`;
   } else if (state === 'results') {
     const rows = standings().map((c, i) => {
@@ -4121,7 +4453,7 @@ function drawPlayerHUD() {
     text(tags.join(' + '), bx + 42, by + 75, 12, '#7cf7ff', 'left', 800);
   }
 
-  if (p.city) drawCityPanel(p);
+  if (p.city) { drawCityPanel(p); drawLawHUD(p); }
   else drawRacePanels(p);
 
   drawMinimap();
@@ -4181,7 +4513,7 @@ function drawRacePanels(p) {
 }
 
 function drawCityPanel(p) {
-  panel(16, 16, 230, 122);
+  panel(16, 16, 230, 140);
   text('CITY', 32, 46, 22, '#fff', 'left', 800);
   text('FREE ROAM', 96, 46, 11, '#8a9099', 'left', 700);
   const rows = [
@@ -4189,11 +4521,44 @@ function drawCityPanel(p) {
     ['DRIVEN', `${(p.dist / 1609.34).toFixed(2)} mi`],
     ['HOPS', `${p.hops}`],
     ['0–60', fmtSec(p.best060)],
+    ['FINES', `$${law.fines.toLocaleString()}`],
   ];
   rows.forEach(([k, v], i) => {
     text(k, 32, 70 + i * 18, 10, '#8a9099', 'left', 700);
     text(v, 92, 70 + i * 18, 13, '#d0d4d9', 'left', 600);
   });
+}
+
+// wanted stars, the posted limit, and how close you are to losing them or being arrested
+function drawLawHUD(p) {
+  const x = W - 216, sp = Math.hypot(p.V[0], p.V[2]);
+  panel(x, 16, 200, 92);
+  const blink = law.stars > 0 && !law.hunterSees && Math.floor(performance.now() / 300) % 2;
+  for (let i = 0; i < 5; i++) {
+    const lit = i < law.stars;
+    text('★', x + 26 + i * 34, 52, 30, lit ? (blink ? 'rgba(242,194,48,0.35)' : '#f2c230') : 'rgba(255,255,255,0.14)', 'center', 900);
+  }
+  if (law.stars > 0) {
+    const f = law.hunterSees ? 0 : clamp(law.unseenT / escapeTime(), 0, 1);
+    text(law.hunterSees ? 'POLICE ON YOU' : 'OUT OF SIGHT — STAY HIDDEN', x + 16, 78, 10, law.hunterSees ? '#ff6b6b' : '#9fd4ff', 'left', 800);
+    ctx.fillStyle = 'rgba(255,255,255,0.12)'; ctx.fillRect(x + 16, 86, 168, 5);
+    ctx.fillStyle = '#9fd4ff'; ctx.fillRect(x + 16, 86, 168 * f, 5);
+  } else text(law.seen ? 'POLICE NEARBY' : 'NOT WANTED', x + 16, 82, 10, law.seen ? '#f2c230' : '#8a9099', 'left', 800);
+  // speed limit sign by the speedo; the needle readout goes red once you'd be pulled over
+  const sx = W / 2 - 128, sy = H - 150;
+  ctx.fillStyle = '#f4f4f0'; ctx.strokeStyle = '#111'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.roundRect(sx, sy, 44, 56, 5); ctx.fill(); ctx.stroke();
+  text('SPEED', sx + 22, sy + 12, 7, '#111', 'center', 800);
+  text('LIMIT', sx + 22, sy + 21, 7, '#111', 'center', 800);
+  text('35', sx + 22, sy + 47, 22, sp > SPEED_LIMIT + 15 / MPH ? '#d0021b' : '#111', 'center', 900);
+  if (law.bustT > 0 && !p.finished) {
+    const f = clamp(law.bustT / 2.5, 0, 1), cx = W / 2, cy = H * 0.3;
+    ctx.lineWidth = 6; ctx.lineCap = 'round';
+    ctx.strokeStyle = 'rgba(255,255,255,0.15)'; ctx.beginPath(); ctx.arc(cx, cy, 34, 0, Math.PI * 2); ctx.stroke();
+    ctx.strokeStyle = '#ff4b4b'; ctx.beginPath(); ctx.arc(cx, cy, 34, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * f); ctx.stroke();
+    text('PULL OVER', cx, cy + 62, 18, '#ff6b6b', 'center', 900);
+    text('drive off to get away', cx, cy + 80, 11, '#d0d4d9', 'center', 600);
+  }
 }
 
 const mini = (() => {
@@ -4254,8 +4619,10 @@ function drawCityMap() {
   ctx.fillStyle = 'rgba(22,24,29,0.92)';
   ctx.fillRect(X(-e), Y(-e), 2 * e * sc, (e - o) * sc); ctx.fillRect(X(-e), Y(o), 2 * e * sc, (e - o) * sc);
   ctx.fillRect(X(-e), Y(-e), (e - o) * sc, 2 * e * sc); ctx.fillRect(X(o), Y(-e), (e - o) * sc, 2 * e * sc);
-  ctx.fillStyle = 'rgba(235,238,242,0.85)';
-  for (const c of city.traffic) { ctx.beginPath(); ctx.arc(X(c.P[0]), Y(c.P[1]), 2, 0, Math.PI * 2); ctx.fill(); }
+  for (const c of city.traffic) {
+    ctx.fillStyle = c.police ? (c.state === 'pursuit' ? (Math.floor(performance.now() / 150) % 2 ? '#ff3b3b' : '#4b8bff') : '#4b8bff') : 'rgba(235,238,242,0.85)';
+    ctx.beginPath(); ctx.arc(X(c.P[0]), Y(c.P[1]), c.police ? 3.2 : 2, 0, Math.PI * 2); ctx.fill();
+  }
   const cx = X(p.P[0]), cy = Y(p.P[2]), fx = p.F[0], fz = p.F[2];
   ctx.fillStyle = '#e31937'; ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5;
   ctx.beginPath();
